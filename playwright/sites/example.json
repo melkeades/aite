@@ -1,0 +1,8 @@
+{
+  "shortName": "my-site",
+  "name": "My Site",
+  "siteId": "000000000000000000000000",
+  "designer": "https://my-site.design.webflow.com/",
+  "staging": "https://my-site.webflow.io/",
+  "notes": "Optional. Anything site-specific the helpers or agents should know (key pages, component ids, quirks)."
+}

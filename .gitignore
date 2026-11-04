@@ -1,0 +1,23 @@
+# Chrome profile: cookies, saved logins, autofill, local storage and session tokens. Never commit it.
+# Chrome creates it on first launch; on a new machine just log in once.
+chrome-profile/
+
+# Runtime state and logs (may contain page data and process lists); the driver token grants code execution
+.driver-token-*
+STOP
+STOP_test
+*.log
+*.out
+*.err
+
+# Stress-test outputs
+playwright/tests/results.json
+playwright/tests/ri.json
+playwright/tests/ri_calls.txt
+
+.env
+__pycache__/
+
+# Per-site local settings (written by open_site); only the template is shared
+playwright/sites/*.json
+!playwright/sites/example.json
