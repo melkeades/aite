@@ -29,11 +29,23 @@ Mandatory. README.md has setup and details. Keep both files site-agnostic; site-
 - Designer state (props, settings, drafts, templates without a public page) is read in the Designer, through the bridge.
 - The rendered result of the current Designer state (what is painted, computed styles, layout before a publish) is read from the canvas DOM: `evaluate_t(canvas(), js)`. The canvas doesn't run the site's custom code (script-built elements exist only on the live page), shows every FAQ answer open, and adds `data-wf-id` grid rules with `minmax(75px, auto)` rows, which can change heights.
 - A live page shows only the last publish. Use it for behaviour (hovers, IX, scroll, scripts) and to check after a publish, never as the source for the Designer's current state.
-- Single Designer API calls, and page loops in one window (`wb.each_page`), go through `wb.py` (README.md "Relay"): Playwright isn't in that path, so it works while the driver is busy (`x.py` is refused with exit 5, `wb.py` still answers in about 40 ms) and a hung call only costs its own timeout.
-- Bulk reads across many pages use `run_pages()` through `x.py`, over 3 windows: 36 pages took 120 s against 291 s in one window, with identical results (on 12 light pages it was only 1.3× faster). README.md has the recipe. Run Designer calls in parallel inside the body.
+- Single Designer API calls, and page loops in one window (`wb.each_page`), go through `wb.py` (README.md "Relay"); work across many pages follows "Concurrency" below. `wb.py`: Playwright isn't in that path, so it works while the driver is busy (`x.py` is refused with exit 5, `wb.py` still answers in about 40 ms) and a hung call only costs its own timeout.
 - Use `js()` and `run_items` only inside an `x.py` snippet that also drives the Designer UI or a live page. `open_site()` runs through `x.py` and connects the relay.
-- Keep every Designer tab in front of its window. A tab behind another tab is throttled to about one call per second; `bring_to_front()` fixes it. Close extra windows with `close_designer_windows()` when done.
 - Screenshots only when asked, when no value can answer the question, or for a QA side-by-side against a mock. Never in bulk: take each `snap()` in its own `x.py` call, because it can stall for minutes (68–141 s seen; 1–3 s is typical).
+
+## Concurrency
+Why:
+- A Designer has one current page, and `webflow` calls see only that page. A page switch costs seconds (1.4–9 s measured), so work across pages gets faster only with more Designers, each on its own page. Two loops on one Designer switch each other's page: in a test, 8 pages took 55 s, no faster than one loop, and one switch never landed.
+- Chrome throttles a tab that isn't in front of its window to about one Designer call per second (14 s a page instead of 5.4 s). So each extra Designer needs its own window, in front. On 12 pages: one window 64.6 s, two tabs in one window 81.7 s, two windows 33.6 s, three windows 26.9 s. Each added window raises the per-page time, so 3 is the default.
+- The driver runs one snippet at a time on one thread and can't be interrupted. A second Playwright client on the same Chrome sees the Designer's frames blank, so never start one.
+
+How:
+- On one page: run the calls together with `Promise.all` inside one body (50 writes took 0.46 s, about 10× faster than one by one).
+- Across pages: `run_pages(page_ids, BODY, out, arg, n=3)` in an `x.py` snippet (recipe in README.md "Speed and reliability"). `designer_windows(3)` opens or reuses one Designer per window, launches a bridge app in each, places them side by side and brings each to front. Each window then runs its own page loop inside the Designer (switch, wait, read), so the windows work at the same time while the driver only polls each about once a second and saves results by page id. A final sweep collects anything a poll missed. Call again until `remaining` is 0, then `close_designer_windows()`.
+- Measured: 36 pages took 120 s over 3 windows against 291 s in one, with identical results. On 12 light pages it was only 1.3× faster, so for a handful of pages one window is enough.
+- `wb.py` reaches one Designer per site (the relay keeps one connection per site), so `wb.each_page` is one window. It runs beside the driver, so use it while an `x.py` snippet is busy.
+- Keep every Designer tab in front of its window (`bring_to_front()`), and close the extra windows when done.
+- Sessions share one driver: a request while another snippet runs gets exit 5 (refused, not queued; handle it as above). Each snippet names its own site, so sessions never inherit each other's site.
 
 ## Editing in Webflow
 - Data API for one-offs, the bridge for bulk work (about 100× faster), the Designer UI last.
