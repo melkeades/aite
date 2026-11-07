@@ -156,17 +156,6 @@ def connect():
     env.update(browser=browser, context=context, page=page)
     blocked.clear()
     block_media()
-    allow_local_network(browser)
-
-
-def allow_local_network(browser):
-    # Pages that load a local dev server (e.g. a Vite origin on the LAN) otherwise stop on Chrome's
-    # "Access other devices on your local network" prompt. No origin = every origin, for this Chrome session.
-    try:
-        browser.new_browser_cdp_session().send(
-            "Browser.setPermission", {"permission": {"name": "local-network-access"}, "setting": "granted"})
-    except Exception as e:
-        print("local-network-access not granted:", e, flush=True)
 
 
 def stack_down():

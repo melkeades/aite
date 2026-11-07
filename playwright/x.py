@@ -12,7 +12,8 @@ Exit codes:
   3 stack down (watchdog STOP, Chrome gone, or driver not running)
   4 over budget: the snippet ran out of time (if "still running", the driver stays busy until it ends)
   5 busy: another snippet is running; this one was refused, not queued
-On 3, 4 or 5: stop and tell the user what happened (the printed reason, and `x.py --status`). Don't wait silently.
+On 4, 5, or 3 with WATCHDOG STOPPED CHROME: stop and tell the user what happened (the printed reason, and `x.py --status`).
+On any other 3: say why and restart the stack with the README commands. Don't wait silently.
 Every request carries the token the driver wrote to .driver-token-<port> when it started; a refusal (403) exits 1."""
 import os, sys, json, urllib.request, urllib.error
 

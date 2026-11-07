@@ -4,6 +4,7 @@ chrome-profile/
 
 # Runtime state and logs (may contain page data and process lists); the driver token grants code execution
 .driver-token-*
+.relay-token-*
 STOP
 STOP_test
 *.log

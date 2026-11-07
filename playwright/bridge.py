@@ -180,7 +180,68 @@ def open_site(ref, bridge=True, timeout=120):
     info = r["v"] or {}
     if info.get("shortName") and info["shortName"] != cfg["shortName"]:
         raise RuntimeError(f"bridge is on {info['shortName']}, expected {cfg['shortName']}")
-    return save_site(cfg["key"], siteId=info.get("siteId"), name=info.get("siteName"))
+    saved = save_site(cfg["key"], siteId=info.get("siteId"), name=info.get("siteName"))
+    relay_attach()
+    return saved
+
+
+def grant_local_network(url):
+    """Let this URL's origin reach local and LAN addresses. Chrome ignores Browser.setPermission without an origin
+    (it answers ok, the state stays denied) and grants these three permissions separately."""
+    p = urlparse(url)
+    origin = f"{p.scheme}://{p.netloc}"
+    s = browser.new_browser_cdp_session()
+    for name in ("local-network-access", "local-network", "loopback-network"):
+        try:
+            s.send("Browser.setPermission", {"permission": {"name": name}, "setting": "granted", "origin": origin})
+        except Exception as e:  # a Chrome version may not know one of the names
+            print(f"{name} not granted for {origin}:", str(e)[:120])
+    return origin
+
+
+def relay_up():
+    """Start relay.py if it isn't running (it outlives the driver). Returns its HTTP port."""
+    import socket, subprocess, sys
+    here = globals().get("HERE") or os.getcwd()
+    port = int(os.environ.get("RELAY_PORT", 8770))
+
+    def listening():
+        with socket.socket() as s:
+            s.settimeout(1)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    if not listening():
+        log = open(os.path.join(here, "relay.out"), "a")
+        detached = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+        subprocess.Popen([sys.executable, "-I", "-u", os.path.join(here, "relay.py")], cwd=here, stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, **detached)
+        t0 = time.time()
+        while not listening():
+            if time.time() - t0 > 10:
+                raise RuntimeError("relay.py did not start: see relay.out")
+            time.sleep(0.1)
+    return port
+
+
+def relay_attach(ref=None):
+    """Connect this site's Designer to relay.py, so wb.py can reach it without Playwright. It stays connected through
+    Designer reloads while this driver runs, and across relay restarts. Never fails the caller: returns True or False."""
+    try:
+        here = globals().get("HERE") or os.getcwd()
+        d, port = designer(ref), relay_up()
+        grant_local_network(d.url)
+        token = _json.load(open(os.path.join(here, f".relay-token-{port}")))["client"]
+        config = _json.dumps({"port": port + 1, "token": token, "prelude": _PRELUDE})
+        src = open(os.path.join(here, "relay.js"), encoding="utf-8").read().replace("__CONFIG__", config)
+        tabs = globals().setdefault("_relay_tabs", {})
+        if tabs.get(id(d)) is not d:
+            d.add_init_script(src)  # every future document in this tab, the bridge app frame included
+            tabs[id(d)] = d
+        for target in (d, bridge_frame(ref)):  # the documents already open
+            target.evaluate(src)
+        return True
+    except Exception as e:
+        print("relay not attached:", str(e)[:200])
+        return False
 
 
 def live(path="/", fresh=True, ref=None):
@@ -192,6 +253,7 @@ def live(path="/", fresh=True, ref=None):
     if fresh:
         url += ("&" if "?" in url else "?") + f"v={int(time.time())}"
     t = _tab(cfg["staging"])
+    grant_local_network(url)
     t.goto(url, wait_until="load", timeout=60000)
     return t
 
@@ -285,9 +347,11 @@ def until(body, timeout=10, every=0.15, arg=None):
 def switch_page(page, timeout=20, settle=1.5):
     """Switch the Designer to a page (id, name or slug) without awaiting the switch (awaiting can hang), then poll
     until it is current. Returns the seconds it took."""
-    r = js("let p = null; for (const x of await webflow.getAllPagesAndFolders()) {"
-           " if (/folder/i.test(x.type || '')) continue;"
-           " if (x.id === a || (await x.getName?.()) === a || (await x.getSlug?.()) === a) { p = x; break } }"
+    r = js("const all = (await webflow.getAllPagesAndFolders()).filter(x => !/folder/i.test(x.type || ''));"
+           " let p = all.find(x => x.id === a);"
+           " if (!p) { const hit = (await Promise.all(all.map(async x => ((await x.getName?.()) === a || (await x.getSlug?.()) === a) && x))).filter(Boolean);"
+           "   if (hit.length > 1) throw new Error('AMBIGUOUS: ' + hit.length + ' pages match ' + a + ' (' + hit.map(x => x.id).join(', ') + '); pass an id');"
+           "   p = hit[0] }"
            " if (!p) throw new Error('no page ' + a); webflow.switchPage(p); return p.id", page)
     if not r["ok"]:
         raise RuntimeError(f"switch_page: {r['err']}")
@@ -343,12 +407,14 @@ def select(element_id):
     return r["v"]
 
 
-def launch_bridge(timeout=40):
-    """Launch the MCP Bridge App in this site's Designer (Apps panel → app → Launch) and minimize it. No-op if its
-    frame is already there. Returns the seconds it took."""
-    d, t0 = designer(), time.time()
-    if any(EXT in f.url and not f.is_detached() for f in d.frames):
-        return 0
+def _bridge_of(d):
+    """The live bridge app frame in Designer tab d, or None."""
+    return next((f for f in reversed(d.frames) if EXT in f.url and not f.is_detached()), None)
+
+
+def _launch_app(d, timeout=40):
+    """The Apps panel clicks that launch the bridge app in Designer tab d, then minimize it. Returns its frame."""
+    t0 = time.time()
     app = d.get_by_text("Webflow MCP Bridge App", exact=True)
     if not app.count():
         d.locator("[aria-label^='Apps']").first.click()  # left-rail Apps icon ("Apps (E)")
@@ -357,7 +423,7 @@ def launch_bridge(timeout=40):
     d.wait_for_timeout(1500)
     launch = d.get_by_role("button", name=re.compile(r"^Launch"))
     (launch if launch.count() else d.get_by_text("Launch", exact=True)).first.click(timeout=10000)
-    while not any(EXT in f.url and not f.is_detached() for f in d.frames):
+    while not _bridge_of(d):
         check()
         if time.time() - t0 > timeout:
             raise RuntimeError("bridge frame did not appear")
@@ -366,6 +432,167 @@ def launch_bridge(timeout=40):
     collapse = d.locator('button[aria-label="Collapse"]')
     if collapse.count():
         collapse.first.click()  # minimize, never close
+    return _bridge_of(d)
+
+
+def designer_windows(n=3, ref=None):
+    """n Designer tabs of this site, each in its own Chrome window with the bridge app running, side by side and each
+    in front of its window. Chrome throttles a tab that isn't in front of its window (Designer calls drop to about
+    one per second), so parallel work needs windows, not tabs. Reuses open Designers; returns the tabs."""
+    cfg = site(ref)
+    if not cfg:
+        raise RuntimeError("designer_windows(): no site; pass x.py --site <key> or call use('<key>')")
+    host = _host(cfg["designer"])
+    bs = browser.new_browser_cdp_session()
+    win = lambda p: _cdp(p).send("Browser.getWindowForTarget")["windowId"]
+    tabs = {}
+    for p in context.pages:
+        if _host(p.url) == host:
+            tabs.setdefault(win(p), p)  # one Designer per window
+    pages = list(tabs.values())
+    if not pages:
+        raise RuntimeError(f"DESIGNER NOT OPEN for {cfg['key']}: open_site('{cfg['key']}')")
+    for p in pages:
+        if not _bridge_of(p):  # e.g. after a driver restart: this client can't see the old frame
+            p.reload(wait_until="domcontentloaded", timeout=90000)
+            _wait_designer(p, 120)
+            _launch_app(p)
+    while len(pages) < n:
+        progress(f"opening Designer window {len(pages) + 1} of {n}")
+        known = set(id(p) for p in context.pages)
+        bs.send("Target.createTarget", {"url": "about:blank", "newWindow": True})
+        end, new = time.time() + 15, []
+        while not new:
+            if time.time() > end:
+                raise RuntimeError("new Chrome window did not appear")
+            pages[0].wait_for_timeout(200)  # lets Playwright see the new page (time.sleep would not)
+            new = [p for p in context.pages if id(p) not in known]
+        d = new[0]
+        block_media(d)
+        d.goto(cfg["designer"], wait_until="domcontentloaded", timeout=90000)
+        _wait_designer(d, 120)
+        _launch_app(d)
+        pages.append(d)
+    pages = pages[:n]
+    sw, sh = pages[0].evaluate("[screen.availWidth, screen.availHeight]")
+    for i, p in enumerate(pages):
+        w = win(p)
+        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"windowState": "normal"}})
+        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"left": i * sw // n, "top": 0, "width": sw // n,
+                                                                       "height": min(sh, 1000)}})
+        p.bring_to_front()
+    relay_attach(ref)  # a reload above drops the relay script; reconnect it (no-op if it's still there)
+    return pages
+
+
+def close_designer_windows(ref=None):
+    """Close every Designer tab of this site except the first (the one the relay is connected to), and give its window
+    the default size again."""
+    cfg = site(ref)
+    host = _host(cfg["designer"])
+    des = [p for p in context.pages if _host(p.url) == host]
+    for p in des[1:]:
+        p.close()
+    if des:
+        bs = browser.new_browser_cdp_session()
+        w = _cdp(des[0]).send("Browser.getWindowForTarget")["windowId"]
+        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"windowState": "normal"}})
+        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"left": 0, "top": 0, "width": 1600, "height": 1000}})
+        des[0].bring_to_front()
+    relay_attach(ref)
+    return len(des[1:])
+
+
+_RUN_WORKER = r"""async (x) => {
+  const gen = (window.__runGen = (window.__runGen || 0) + 1);
+  window.__runOut = {}; window.__runDone = false; (window.__runAll = window.__runAll || {})[gen] = {};
+  const read = new (async () => {}).constructor('a', x.prelude + x.body);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  (async () => {
+    for (const id of x.ids) {
+      if (window.__runGen !== gen) return;
+      const t0 = performance.now();
+      try {
+        const p = (await webflow.getAllPagesAndFolders()).find(q => q.id === id);
+        if (!p) throw new Error('no page ' + id);
+        webflow.switchPage(p);  // never awaited: awaiting can hang
+        let ok = false;
+        for (let i = 0; i < 300 && !ok; i++) {
+          if (window.__runGen !== gen) return;
+          ok = !(await webflow.getCurrentComponent()) && (await webflow.getCurrentPage()).id === id;
+          if (!ok) await sleep(100);
+        }
+        if (!ok) throw new Error('page not current after 30 s');
+        await sleep(350);
+        const v = await read(x.arg);  // finish first: `out[id] = await …` would pick the object before the await
+        window.__runOut[id] = window.__runAll[gen][id] = { v, secs: Math.round(performance.now() - t0) / 1000 };
+      } catch (e) {
+        window.__runOut[id] = window.__runAll[gen][id] = { error: String(e && e.message || e).slice(0, 300), secs: Math.round(performance.now() - t0) / 1000 };
+      }
+    }
+    if (window.__runGen === gen) window.__runDone = true;
+  })();
+  return gen;
+}"""
+_RUN_POLL = "async () => { const r = window.__runOut || {}; window.__runOut = {}; return { done: !!window.__runDone, r } }"
+_RUN_STOP = "async () => { window.__runGen = (window.__runGen || 0) + 1; return 1 }"
+_RUN_ALL = "async (g) => (window.__runAll || {})[g] || {}"
+
+
+def run_pages(pages, body, out, arg=None, n=3, secs=240, ref=None):
+    """Run a js()-style body on every page id, spread over n Designer windows (designer_windows). Each window runs its
+    own page loop inside the Designer, so the windows work at the same time. Results go to the JSON file `out` as they
+    arrive; pages already saved without an error are skipped, so call it again until remaining is 0. Stops its loops
+    after `secs` seconds, counted from the call (opening windows included): give x.py a budget about 30 s above that.
+    A final sweep collects every result the loops kept; recovered_in_sweep above 0 means the polling missed some."""
+    t0 = time.time()
+    store = _json.load(open(out, encoding="utf-8")) if os.path.exists(out) else {}
+    todo = [p for p in pages if not (p in store and "error" not in store[p])]
+    frames = []
+    if todo:
+        tabs = designer_windows(min(n, len(todo)), ref)
+        frames = [_bridge_of(p) for p in tabs]
+        gens = [evaluate_t(f, _RUN_WORKER, {"ids": todo[i::len(frames)], "body": body, "arg": arg, "prelude": _PRELUDE},
+                           ms=15000) for i, f in enumerate(frames)]
+    done = [False] * len(frames)
+    while not all(done):
+        got = 0
+        for i, f in enumerate(frames):
+            if done[i]:
+                continue
+            r = evaluate_t(f, _RUN_POLL, None, ms=15000)
+            store.update(r["r"])
+            got += len(r["r"])
+            done[i] = r["done"]
+        if got:
+            _json.dump(store, open(out, "w", encoding="utf-8"), default=str)
+        progress(f"{sum(1 for p in pages if p in store)}/{len(pages)} pages in {len(frames)} windows")
+        if time.time() - t0 > secs:
+            for f in frames:
+                evaluate_t(f, _RUN_STOP, None, ms=15000)
+            break
+        frames[0].page.wait_for_timeout(1000)
+    recovered = 0
+    for f, g in zip(frames, gens if frames else []):  # final sweep: every result the loop kept
+        for k, v in evaluate_t(f, _RUN_ALL, g, ms=15000).items():
+            if k not in store or ("error" in store[k] and "error" not in v):
+                store[k] = v
+                recovered += 1
+    _json.dump(store, open(out, "w", encoding="utf-8"), default=str)
+    left = [p for p in pages if p not in store]
+    times = [store[p]["secs"] for p in pages if p in store and "secs" in store[p]]
+    return {"done_total": len(pages) - len(left), "remaining": len(left), "windows": len(frames), "recovered_in_sweep": recovered,
+            "wall_s": round(time.time() - t0, 1), "avg_page_s": round(sum(times) / len(times), 2) if times else None,
+            "errors": [p for p in pages if "error" in store.get(p, {})]}
+
+
+def launch_bridge(timeout=40):
+    """Launch the MCP Bridge App in this site's Designer (Apps panel → app → Launch) and minimize it. No-op if its
+    frame is already there. Returns the seconds it took."""
+    d, t0 = designer(), time.time()
+    if _bridge_of(d):
+        return 0
+    _launch_app(d, timeout)
     r = js("return 1")
     if not r["ok"]:
         raise RuntimeError("bridge not answering: " + r["err"])
@@ -379,4 +606,5 @@ def relaunch_bridge(timeout=100):
     d.reload(wait_until="domcontentloaded", timeout=90000)
     _wait_designer(d, timeout)
     launch_bridge()
+    relay_attach()
     return round(time.time() - t0, 1)
