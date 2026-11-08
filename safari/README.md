@@ -17,7 +17,7 @@ Windows (Claude Code)
 | `iphone` MCP | PC, user scope | per Claude Code session | — |
 | Tunnel 9223 → 9222 | PC task "iPhone CDP tunnel" → `~/.local/bin/iphone-tunnel.ps1` | at Windows logon, reconnects every 10 s | `%LOCALAPPDATA%\iphone-tunnel.log` |
 | iPhone CDP bridge | Mac LaunchAgent `com.seres.iphone-cdp` | at Mac login, restarts on exit | `~/Library/Logs/iphone-cdp.log` |
-| `tunneld` (root) | Mac, Terminal tab (see [tunneld](#tunneld)) | by hand | that tab |
+| `tunneld` (root, iOS developer tunnel) | Mac LaunchDaemon `com.seres.pmd3-tunneld` | at Mac boot, before login; restarts on exit | `/var/log/pmd3-tunneld.log` |
 
 Machines: Mac `seres@192.168.2.119` (macOS 27.2, Safari 27.2 and Safari Technology Preview), iPhone on USB to the Mac (iOS 26.5.2), pymobiledevice3 11.43.1, PC at `192.168.2.152` (Vite on `:5173`).
 
@@ -40,13 +40,8 @@ Machines: Mac `seres@192.168.2.119` (macOS 27.2, Safari 27.2 and Safari Technolo
    ```
 
 7. iPhone: plug into the Mac by USB, tap **Trust**. Settings > Apps > Safari > Advanced: **Web Inspector** and **Remote Automation** on. Turn on the Tampermonkey `devMode` script on the phone if you want the Vite build there.
-8. `tunneld` in Terminal tab 1, left running (asks for the Mac password):
-
-   ```zsh
-   sudo env PYTHONPATH=/Users/seres/Library/Python/3.9/lib/python/site-packages python3 -m pymobiledevice3 remote tunneld
-   ```
-
-9. The bridge as a LaunchAgent, instead of a second Terminal tab. `~/Library/LaunchAgents/com.seres.iphone-cdp.plist`:
+8. `tunneld` as a LaunchDaemon: see [tunneld](#tunneld).
+9. The bridge as a LaunchAgent. `~/Library/LaunchAgents/com.seres.iphone-cdp.plist`:
 
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
@@ -155,7 +150,7 @@ Run these one at a time in PowerShell.
 | `iphone` on `127.0.0.1:9222` | `127.0.0.1:9223` | 9222 is the Playwright Chrome; the MCP would have driven that Chrome, and the tunnel failed with `bind … Permission denied` |
 | `--browserUrl <http://127.0.0.1:9222>` | no angle brackets | Notion wraps links in `<>`; pasted as-is the URL is invalid |
 | `npx …` | `cmd /c npx …` | stdio servers on native Windows can't start `npx` directly |
-| Terminal tab 2 for the bridge, PowerShell window for the tunnel | LaunchAgent and logon task | both died with their windows and didn't come back after a reboot |
+| Terminal tabs for `tunneld` and the bridge, PowerShell window for the tunnel | LaunchDaemon, LaunchAgent and logon task | they died with their windows and didn't come back after a reboot |
 
 ## Checks
 
@@ -171,7 +166,8 @@ claude mcp list                                                     # safari and
 ```zsh
 launchctl print gui/$(id -u)/com.seres.iphone-cdp | grep -E "state =|pid =|last exit"
 tail -20 ~/Library/Logs/iphone-cdp.log
-ps -axo pid,user,command | grep "remote tunneld" | grep -v grep
+sudo launchctl print system/com.seres.pmd3-tunneld | grep -E "state =|pid ="
+curl -s http://127.0.0.1:49151/                                     # tunneld: the iPhone's tunnel, keyed by its UDID
 /Users/seres/Library/Python/3.9/bin/pymobiledevice3 usbmux list    # the iPhone, ConnectionType USB
 ```
 
@@ -181,14 +177,16 @@ ps -axo pid,user,command | grep "remote tunneld" | grep -v grep
 
 - **Restart the bridge** (after a pymobiledevice3 upgrade, or if `/json/list` is stale): `launchctl kickstart -k gui/$(id -u)/com.seres.iphone-cdp`
 - **Restart the tunnel:** `Stop-ScheduledTask 'iPhone CDP tunnel'; Start-ScheduledTask 'iPhone CDP tunnel'`
-- **Upgrade pymobiledevice3:** `python3 -m pip install --user -U pymobiledevice3`, then restart the bridge and `tunneld`.
+- **Restart `tunneld`:** `sudo launchctl kickstart -k system/com.seres.pmd3-tunneld`
+- **Upgrade pymobiledevice3:** `python3 -m pip install --user -U pymobiledevice3`, then restart `tunneld` and the bridge.
 - **Mac IP changes:** update `~/.ssh/config` (`Host`), `iphone-tunnel.ps1`, and re-add the `safari` MCP. Better: a DHCP reservation for `.119` (and `.152` for Vite).
-- **After a Mac reboot:** the LaunchAgent starts only once `seres` is logged in to the desktop, not at the login screen. `tunneld` has to be started again in Terminal.
+- **After a Mac reboot:** the LaunchAgent starts only once `seres` is logged in to the desktop, not at the login screen. `tunneld` starts at boot on its own.
 - **After a Windows reboot:** the task starts at logon and retries every 10 s until the Mac answers.
 - **Remove:**
 
   ```zsh
   launchctl bootout gui/$(id -u)/com.seres.iphone-cdp && rm ~/Library/LaunchAgents/com.seres.iphone-cdp.plist
+  sudo launchctl bootout system/com.seres.pmd3-tunneld && sudo rm /Library/LaunchDaemons/com.seres.pmd3-tunneld.plist
   ```
 
   ```powershell
@@ -198,7 +196,9 @@ ps -axo pid,user,command | grep "remote tunneld" | grep -v grep
 
 ### tunneld
 
-`tunneld` (root) provides the iOS 17+ developer tunnel. It currently runs from Terminal tab 1 and doesn't survive a reboot. Whether `webinspector cdp` works without it hasn't been tested; screenshots and JS worked with it running. To make it permanent, a LaunchDaemon (needs `sudo`), `/Library/LaunchDaemons/com.seres.pmd3-tunneld.plist`:
+`tunneld` (root) provides the iOS 17+ developer tunnel. It runs as a LaunchDaemon: it starts at boot, before anyone logs in, restarts if it exits, and opens a tunnel to the iPhone as soon as it's plugged in (the log shows `Created tunnel --rsd …`). Whether `webinspector cdp` works without it hasn't been tested; screenshots and JS worked with it running. It needs root, so installing it needs the Mac password.
+
+`/Library/LaunchDaemons/com.seres.pmd3-tunneld.plist` (`/usr/bin/python3` with the user's `PYTHONPATH` is the same Xcode Python 3.9 that runs the bridge):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -222,11 +222,20 @@ ps -axo pid,user,command | grep "remote tunneld" | grep -v grep
 </plist>
 ```
 
+Install it (copy the plist to `~` first, e.g. with `scp` from the PC; stop any `tunneld` running in a Terminal with Ctrl+C, or two copies fight over port 49151):
+
 ```zsh
+sudo mv ~/com.seres.pmd3-tunneld.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/com.seres.pmd3-tunneld.plist
 sudo chmod 644 /Library/LaunchDaemons/com.seres.pmd3-tunneld.plist
-# stop the Terminal-tab copy first (Ctrl+C), then:
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.seres.pmd3-tunneld.plist
+sudo launchctl print system/com.seres.pmd3-tunneld | grep -E "state =|pid ="    # state = running
+```
+
+The log starts with a urllib3 `NotOpenSSLWarning` (LibreSSL); it's harmless. To run it by hand instead, for debugging:
+
+```zsh
+sudo env PYTHONPATH=/Users/seres/Library/Python/3.9/lib/python/site-packages python3 -m pymobiledevice3 remote tunneld
 ```
 
 ## Troubleshooting
