@@ -250,6 +250,7 @@ Learned from the first test run (desktop through the `safari` MCP, iPhone throug
 - **Mac screenshots:** pass `savePath`. Without it the PNGs came back cropped at odd sizes (474×463, 925×413); with it, the full viewport at 2× (2048×1328). The file is written on the Mac: `scp seres@192.168.2.119:/tmp/shot.png .`
 - **Mac reload:** the MCP has no reload tool, and `location.reload()` through `evaluate_javascript` didn't reload. Use `navigate_to_url` with the same URL (a navigation, not a true Cmd+R).
 - **Mac window:** each MCP connection opens its own Safari Technology Preview window, 1024×610 by default. Use `set_viewport_size` for exact widths. `evaluate_javascript` takes a function body: `return` the value.
+- **Without the `iphone` MCP** (tools load only in new sessions): `cdp.ps1` in this folder sends CDP steps to the first matching tab on 9223, e.g. `.\cdp.ps1 -Match '*ca-tims*' -OutDir $env:TEMP -Steps '[{"method":"Page.captureScreenshot","params":{"format":"png"},"save":"shot"}]'`. See its header.
 - **iPhone screenshots:** `Page.captureScreenshot` returns the viewport at device pixels (1170×2097 for 390×699 at 3×), about 0.5 s each. `Page.reload` is a native reload.
 - **iPhone JS:** wrap each `Runtime.evaluate` in `(() => { … })()`. Top-level `const` survives between calls, so a second script declaring the same name fails with `Can't create duplicate variable`.
 - **devMode:** comes from Tampermonkey in each browser, not from injection. Check with `document.devMode === true` and a script `src` containing `5173`.
