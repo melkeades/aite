@@ -215,6 +215,7 @@ ps -axo pid,user,command | grep "remote tunneld" | grep -v grep
   <dict><key>PYTHONPATH</key><string>/Users/seres/Library/Python/3.9/lib/python/site-packages</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
   <key>StandardOutPath</key><string>/var/log/pmd3-tunneld.log</string>
   <key>StandardErrorPath</key><string>/var/log/pmd3-tunneld.log</string>
 </dict>
