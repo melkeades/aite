@@ -173,6 +173,31 @@ curl -s http://127.0.0.1:49151/                                     # tunneld: t
 
 `claude mcp list` only shows that the `iphone` process starts. It says `√ Connected` even with the tunnel down; check `/json/version` on 9223 for that.
 
+**One command for all of it:** `.\cdp.ps1 -Status` (this folder) prints the bridge, the phone's tabs, every local process with a connection open to the phone (the `iphone` MCP of which Claude Code session, or `cdp.ps1`), and the bridge's recent refusals from its log on the Mac. Run it first whenever a tab doesn't answer.
+
+## One client per tab
+
+WebKit serves **one inspector session per tab**, and the bridge passes that on: a tab belongs to one client at a time. This causes almost every "the tab doesn't answer" case, so it's worth knowing who the clients are:
+
+- **The `iphone` MCP of every Claude Code session.** Each session starts its own copy (there are often 5–7 `chrome-devtools-mcp` processes on the PC), but it connects only on its first tool call. From then on it holds **every tab it could attach to, for as long as that Claude Code session lives**, idle or not. It has no disconnect tool.
+- **`cdp.ps1`** and any DevTools frontend, one tab each, for the length of the call.
+- **Safari's Web Inspector on the Mac** (Develop > iPhone). A tab grayed out in that menu is held by some client, usually one of ours.
+
+What happens when two want the same tab:
+
+| Holder | Newcomer | Result |
+|---|---|---|
+| `cdp.ps1` | `cdp.ps1` | the newcomer takes the tab over; the older call ends with `closed by bridge` |
+| an `iphone` MCP | `cdp.ps1`, or another session's `iphone` MCP | the newcomer waits 30 s and gets nothing (`did not release it in time` / `busy with another debugger session`); the MCP keeps the tab |
+| a dead Web Inspector connection | anyone | nobody gets it (`already being debugged over Web Inspector connection X`), even after a bridge restart |
+
+The rules that follow:
+
+1. **One Claude Code session uses the phone at a time,** and within it, one tool: the `iphone` MCP *or* `cdp.ps1`, not both. Two sessions testing on the phone in parallel lock each other out; this happened on 16 Nov, when one session's idle MCP held the tab another session was trying to test, and the second session took it for a stuck bridge.
+2. **To free tabs an idle MCP holds,** restart the bridge (`launchctl kickstart -k gui/$(id -u)/com.seres.iphone-cdp`, Maintenance). It drops every client; each MCP reconnects on its next call. Ask the user first.
+3. **A tab held by a dead connection** survives bridge restarts. Close that tab on the phone (reopening the page gives it a new id). If the phone shows no such tab (Safari keeps hidden pages around), it's harmless: the bridge skips it.
+4. **Close tabs you don't need,** above all background ones: iOS suspends them, they stop answering (`stopped responding (Page.getResourceTree)`), and the `iphone` MCP's `list_pages` then fails for every tab (`the device did not answer Page.getFrameTree`).
+
 ## Maintenance
 
 - **Restart the bridge** (after a pymobiledevice3 upgrade, or if `/json/list` is stale): `launchctl kickstart -k gui/$(id -u)/com.seres.iphone-cdp`
@@ -249,7 +274,11 @@ sudo env PYTHONPATH=/Users/seres/Library/Python/3.9/lib/python/site-packages pyt
 | tunnel log: `bind [127.0.0.1]:9223: Permission denied` | another process holds 9223 (or a second tunnel) | `netstat -ano \| findstr :9223`; the task's `IgnoreNew` prevents duplicates of itself |
 | `/json/version` on 9223 says `Chrome/…` | wrong port somewhere | the tunnel and the `iphone` MCP must both use 9223 |
 | `/json/list` is `[]` | iPhone locked, unplugged, Web Inspector off, or no Safari tab open | unlock, open a tab, check `pymobiledevice3 usbmux list` |
-| a tab is listed but commands get no answer | another inspector holds that page (Safari's Web Inspector on the Mac, or a second client) | WebKit allows one inspector session per page; close the other one |
+| a tab is listed but commands get no answer, or `cdp.ps1` says `closed by bridge` | another client holds the tab ([One client per tab](#one-client-per-tab)) | `.\cdp.ps1 -Status` names the holder: another session's `iphone` MCP → restart the bridge (ask first); a dead connection → close the tab on the phone |
+| `iphone` MCP: `the device did not answer Page.getFrameTree` | one tab doesn't answer (a suspended background tab, or one another client holds), and `list_pages` waits on every tab | close the other tabs on the phone; `-Status` shows which one the bridge marks `stopped responding` |
+| `iphone` MCP: `Missing injected script for given executionContextId` | `navigate_page` to a URL timed out (it always does on WebKit) and left the MCP on the old document | `navigate_page` with `type: reload`; it also times out, but the next call works |
+| `iphone` MCP: `'Accessibility' domain was not found` | WebKit has no Accessibility domain, so `take_snapshot` and every uid-based tool (`click`, `fill`) fail | click and type with `evaluate_script` |
+| bridge log: `Web Inspector connection to the device lost`, then a restart | USB or `webinspectord` hiccup on the phone; the LaunchAgent restarts the bridge by itself | nothing; tabs the old connection held may stay held (row above) |
 | Mac `curl :9222` refused | bridge not running | `launchctl print …`, read `iphone-cdp.log`, `kickstart -k` |
 | `devMode` is `false` | Tampermonkey script off in that browser | enable it in Safari Technology Preview and on the iPhone, reload |
 
@@ -262,5 +291,7 @@ Learned from the first test run (desktop through the `safari` MCP, iPhone throug
 - **Mac window:** each MCP connection opens its own Safari Technology Preview window, 1024×610 by default. Use `set_viewport_size` for exact widths. `evaluate_javascript` takes a function body: `return` the value.
 - **Without the `iphone` MCP** (tools load only in new sessions): `cdp.ps1` in this folder sends CDP steps to the first matching tab on 9223, e.g. `.\cdp.ps1 -Match '*ca-tims*' -OutDir $env:TEMP -Steps '[{"method":"Page.captureScreenshot","params":{"format":"png"},"save":"shot"}]'`. See its header.
 - **iPhone screenshots:** `Page.captureScreenshot` returns the viewport at device pixels (1170×2097 for 390×699 at 3×), about 0.5 s each. `Page.reload` is a native reload.
+- **`iphone` MCP on WebKit** (chrome-devtools-mcp 1.13, 16 Nov): `list_pages`, `evaluate_script` and `take_screenshot` work. `take_snapshot` doesn't (no Accessibility domain), so uid tools don't either: find and click elements in `evaluate_script`. `navigate_page` always reports a timeout although the page loads; follow it with `navigate_page` `type: reload` before the next `evaluate_script`.
+- **Cross-origin iframes** (Typeform, YouTube, maps) can't be reached from the page's scripts. Read the iframe's `src` and open it as the tab's own URL to drive it, then navigate back.
 - **iPhone JS:** wrap each `Runtime.evaluate` in `(() => { … })()`. Top-level `const` survives between calls, so a second script declaring the same name fails with `Can't create duplicate variable`.
 - **devMode:** comes from Tampermonkey in each browser, not from injection. Check with `document.devMode === true` and a script `src` containing `5173`.
