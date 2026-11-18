@@ -4,8 +4,8 @@ so snippets call these directly. Uses the driver globals context, evaluate_t, ch
     open_site("ca-bps")  # or a Designer URL / sites/<key>.json key: opens or reuses its tab, launches the bridge
     r = js("const h = await byId(a); return await h.getDisplayName()", element_id)
     r = js("await tm('rename', () => h.setDisplayName('x')); return 1")   # r["T"] / r["E"]: per-call ms / errors
-    switch_page("Home"); open_canvas(component_id); designer(); canvas(); live("/")
-    t = live("/"); emulate(t, 390); t.reload(); snap(t, "C:/tmp/m.png", full=True); clear_emulation(t)
+    switch_page(page_id); open_canvas(component_id); designer(); canvas()
+    t = live("/pricing")     # one staging page in its own window, right after a change; raises if it doesn't load
     until("return (await webflow.getSelectedElement())?.type === 'Heading'")
     paste_at(1480, 751, "new text")
 
@@ -15,7 +15,7 @@ lasts for that snippet only. Without one, the helpers work only while exactly on
 they refuse rather than guess, so a call never lands in another project's tab.
 
 Every js() call resolves the bridge frame again, so it survives page and canvas switches."""
-import json as _json, os, re, time
+import json as _json, os, random, re, time
 from urllib.parse import urlparse
 
 # Available inside every js() body: `a` (the arg), tm(label, fn, ms=8000) to time one call and keep going on error
@@ -103,7 +103,7 @@ def use(ref):
 
 
 def designer_tabs():
-    return [p for p in context.pages if _host(p.url).endswith(DESIGN)]
+    return [p for p in context.pages if _host(p.url).endswith(DESIGN) and not _owned(p)]
 
 
 def designer(ref=None):
@@ -152,12 +152,38 @@ def _wait_designer(d, timeout):
     d.wait_for_timeout(2000)
 
 
+def _target_id(p):
+    """Chrome's target id of a tab (cached)."""
+    cache = globals().setdefault("_target_ids", {})
+    t = cache.get(id(p))
+    if t is None:
+        t = cache[id(p)] = _cdp(p).send("Target.getTargetInfo")["targetInfo"]["targetId"]
+    return t
+
+
+def _owned(p):
+    """True for a kept session window (ops.py): shared-tab helpers never use those."""
+    ids = globals().get("OWNED")
+    if not ids:
+        return False
+    try:
+        return _target_id(p) in ids
+    except Exception:
+        return False
+
+
+def _shared_pages():
+    return [p for p in context.pages if not _owned(p)]
+
+
 def _tab(url):
     """A tab already on url's host, else a blank one or a new one. A Designer tab gets video blocked before it
-    navigates; every other tab plays video normally."""
+    navigates; every other tab plays video normally. Never a window a Designer job owns, nor the live() window."""
     h = _host(url)
-    tab = (next((p for p in context.pages if _host(p.url) == h), None)
-           or next((p for p in context.pages if p.url == "about:blank"), None) or context.new_page())
+    lives = list(globals().get("_live_tabs", {}).values())
+    shared = [p for p in _shared_pages() if p not in lives]
+    tab = (next((p for p in shared if _host(p.url) == h), None)
+           or next((p for p in shared if p.url == "about:blank"), None) or context.new_page())
     block_media(tab if h.endswith(DESIGN) else None)
     return tab
 
@@ -169,11 +195,21 @@ def open_site(ref, bridge=True, timeout=120):
     cfg = use(ref)
     d = _tab(cfg["designer"])
     if _host(d.url) != _host(cfg["designer"]):
+        _log(f"designer: open_site('{cfg['key']}') opened the main Designer tab (it stays open)")
         d.goto(cfg["designer"], wait_until="domcontentloaded", timeout=90000)
+    else:
+        _log(f"designer: open_site('{cfg['key']}') reused the open Designer tab")
     _wait_designer(d, timeout)
     if not bridge:
         return cfg
-    launch_bridge()
+    try:
+        launch_bridge()
+    except Budget:
+        raise
+    except Exception as e:
+        # typically after a driver restart: the tab is open but this client can't reach its bridge app. Reload once.
+        _log(f"designer: open_site('{cfg['key']}') could not launch the bridge ({str(e).splitlines()[0][:80]}); reloading the Designer tab once")
+        relaunch_bridge()
     r = js("return await webflow.getSiteInfo()")
     if not r["ok"]:
         raise RuntimeError("getSiteInfo failed: " + r["err"])
@@ -244,17 +280,48 @@ def relay_attach(ref=None):
         return False
 
 
+def _new_window(tag):
+    """A new Chrome window with one blank tab, made by this Playwright client and ready to navigate."""
+    bs = browser.new_browser_cdp_session()
+    try:
+        # background: the window opens without taking the keyboard focus from the user
+        bs.send("Target.createTarget", {"url": tag, "newWindow": True, "background": True, "width": 1500, "height": 1000})
+        end, t = time.time() + 15, None
+        while t is None:
+            check()
+            if time.time() > end:
+                raise RuntimeError("new Chrome window did not appear")
+            bs.send("Browser.getVersion")  # a round trip, so Playwright processes the new-page event
+            t = next((p for p in context.pages if p.url == tag), None)
+        t.evaluate("1")  # Playwright finishes setting the tab up before it navigates
+        return t
+    finally:
+        bs.detach()
+
+
 def live(path="/", fresh=True, ref=None):
-    """Open (or reuse) a tab on the site's staging URL + path; fresh adds a cache-buster. Returns the tab."""
+    """One page of the site's staging URL, for a look right after a Designer change inside the same snippet. It gets a
+    window of its own (a tab beside the Designer is not painted, so captures and hovers stall there) and is reused by
+    later calls. Raises RuntimeError if the page does not load (HTTP >= 400, network error, no load event in 60 s).
+    Several pages, several widths, or anything that should not hold the driver: live.py."""
     cfg = site(ref)
     if not cfg:
         raise RuntimeError("live(): no site; pass x.py --site <key> or call use('<key>')")
     url = cfg["staging"].rstrip("/") + "/" + path.lstrip("/")
     if fresh:
         url += ("&" if "?" in url else "?") + f"v={int(time.time())}"
-    t = _tab(cfg["staging"])
+    tabs = globals().setdefault("_live_tabs", {})
+    t = tabs.get(cfg["key"])
+    if t is None or t.is_closed():
+        t = tabs[cfg["key"]] = _new_window(f"about:blank#live-{cfg['key']}")
     grant_local_network(url)
-    t.goto(url, wait_until="load", timeout=60000)
+    try:
+        resp = t.goto(url, wait_until="load", timeout=60000)
+    except Exception as e:
+        raise RuntimeError(f"LOAD FAILED: {str(e).splitlines()[0][:200]} {url}")
+    status = resp.status if resp else None
+    if status is None or status >= 400:
+        raise RuntimeError(f"LOAD FAILED: HTTP {status} {url}")
     return t
 
 
@@ -352,10 +419,13 @@ def switch_page(page, timeout=20, settle=1.5):
            " if (!p) { const hit = (await Promise.all(all.map(async x => ((await x.getName?.()) === a || (await x.getSlug?.()) === a) && x))).filter(Boolean);"
            "   if (hit.length > 1) throw new Error('AMBIGUOUS: ' + hit.length + ' pages match ' + a + ' (' + hit.map(x => x.id).join(', ') + '); pass an id');"
            "   p = hit[0] }"
-           " if (!p) throw new Error('no page ' + a); webflow.switchPage(p); return p.id", page)
+           " if (!p) throw new Error('no page ' + a); return p.id", page)
     if not r["ok"]:
         raise RuntimeError(f"switch_page: {r['err']}")
     page_id = r["v"]
+    r = js("const p = (await webflow.getAllPagesAndFolders()).find(x => x.id === a); webflow.switchPage(p); return 1", page_id)
+    if not r["ok"]:
+        raise RuntimeError(f"switch_page: {r['err']}")
     s, v = until("const c = await webflow.getCurrentComponent(); return !c && (await webflow.getCurrentPage()).id === a",
                  timeout, arg=page_id)
     if s is None:
@@ -435,155 +505,86 @@ def _launch_app(d, timeout=40):
     return _bridge_of(d)
 
 
-def designer_windows(n=3, ref=None):
-    """n Designer tabs of this site, each in its own Chrome window with the bridge app running, side by side and each
-    in front of its window. Chrome throttles a tab that isn't in front of its window (Designer calls drop to about
-    one per second), so parallel work needs windows, not tabs. Reuses open Designers; returns the tabs."""
-    cfg = site(ref)
-    if not cfg:
-        raise RuntimeError("designer_windows(): no site; pass x.py --site <key> or call use('<key>')")
-    host = _host(cfg["designer"])
-    bs = browser.new_browser_cdp_session()
-    win = lambda p: _cdp(p).send("Browser.getWindowForTarget")["windowId"]
-    tabs = {}
-    for p in context.pages:
-        if _host(p.url) == host:
-            tabs.setdefault(win(p), p)  # one Designer per window
-    pages = list(tabs.values())
-    if not pages:
-        raise RuntimeError(f"DESIGNER NOT OPEN for {cfg['key']}: open_site('{cfg['key']}')")
-    for p in pages:
-        if not _bridge_of(p):  # e.g. after a driver restart: this client can't see the old frame
-            p.reload(wait_until="domcontentloaded", timeout=90000)
-            _wait_designer(p, 120)
-            _launch_app(p)
-    while len(pages) < n:
-        progress(f"opening Designer window {len(pages) + 1} of {n}")
-        known = set(id(p) for p in context.pages)
-        bs.send("Target.createTarget", {"url": "about:blank", "newWindow": True})
-        end, new = time.time() + 15, []
-        while not new:
-            if time.time() > end:
-                raise RuntimeError("new Chrome window did not appear")
-            pages[0].wait_for_timeout(200)  # lets Playwright see the new page (time.sleep would not)
-            new = [p for p in context.pages if id(p) not in known]
-        d = new[0]
-        block_media(d)
-        d.goto(cfg["designer"], wait_until="domcontentloaded", timeout=90000)
-        _wait_designer(d, 120)
-        _launch_app(d)
-        pages.append(d)
-    pages = pages[:n]
-    sw, sh = pages[0].evaluate("[screen.availWidth, screen.availHeight]")
-    for i, p in enumerate(pages):
-        w = win(p)
-        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"windowState": "normal"}})
-        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"left": i * sw // n, "top": 0, "width": sw // n,
-                                                                       "height": min(sh, 1000)}})
-        p.bring_to_front()
-    relay_attach(ref)  # a reload above drops the relay script; reconnect it (no-op if it's still there)
-    return pages
+def _wait_designers(tabs, timeout=120):
+    """_wait_designer for several tabs at once: one poll loop over all of them."""
+    t0, left = time.time(), list(tabs)
+    while left:
+        check()
+        left = [d for d in left if not (d.get_by_text("Style", exact=True).count() and d.get_by_text("Settings", exact=True).count())]
+        if left:
+            if time.time() - t0 > timeout:
+                raise RuntimeError(f"{len(left)} Designer(s) did not load")
+            tabs[0].wait_for_timeout(500)
+    tabs[0].wait_for_timeout(2000)
 
 
-def close_designer_windows(ref=None):
-    """Close every Designer tab of this site except the first (the one the relay is connected to), and give its window
-    the default size again."""
-    cfg = site(ref)
-    host = _host(cfg["designer"])
-    des = [p for p in context.pages if _host(p.url) == host]
-    for p in des[1:]:
-        p.close()
-    if des:
-        bs = browser.new_browser_cdp_session()
-        w = _cdp(des[0]).send("Browser.getWindowForTarget")["windowId"]
-        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"windowState": "normal"}})
-        bs.send("Browser.setWindowBounds", {"windowId": w, "bounds": {"left": 0, "top": 0, "width": 1600, "height": 1000}})
-        des[0].bring_to_front()
-    relay_attach(ref)
-    return len(des[1:])
-
-
-_RUN_WORKER = r"""async (x) => {
-  const gen = (window.__runGen = (window.__runGen || 0) + 1);
-  window.__runOut = {}; window.__runDone = false; (window.__runAll = window.__runAll || {})[gen] = {};
-  const read = new (async () => {}).constructor('a', x.prelude + x.body);
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  (async () => {
-    for (const id of x.ids) {
-      if (window.__runGen !== gen) return;
-      const t0 = performance.now();
-      try {
-        const p = (await webflow.getAllPagesAndFolders()).find(q => q.id === id);
-        if (!p) throw new Error('no page ' + id);
-        webflow.switchPage(p);  // never awaited: awaiting can hang
-        let ok = false;
-        for (let i = 0; i < 300 && !ok; i++) {
-          if (window.__runGen !== gen) return;
-          ok = !(await webflow.getCurrentComponent()) && (await webflow.getCurrentPage()).id === id;
-          if (!ok) await sleep(100);
-        }
-        if (!ok) throw new Error('page not current after 30 s');
-        await sleep(350);
-        const v = await read(x.arg);  // finish first: `out[id] = await …` would pick the object before the await
-        window.__runOut[id] = window.__runAll[gen][id] = { v, secs: Math.round(performance.now() - t0) / 1000 };
-      } catch (e) {
-        window.__runOut[id] = window.__runAll[gen][id] = { error: String(e && e.message || e).slice(0, 300), secs: Math.round(performance.now() - t0) / 1000 };
-      }
-    }
-    if (window.__runGen === gen) window.__runDone = true;
-  })();
-  return gen;
-}"""
-_RUN_POLL = "async () => { const r = window.__runOut || {}; window.__runOut = {}; return { done: !!window.__runDone, r } }"
-_RUN_STOP = "async () => { window.__runGen = (window.__runGen || 0) + 1; return 1 }"
-_RUN_ALL = "async (g) => (window.__runAll || {})[g] || {}"
-
-
-def run_pages(pages, body, out, arg=None, n=3, secs=240, ref=None):
-    """Run a js()-style body on every page id, spread over n Designer windows (designer_windows). Each window runs its
-    own page loop inside the Designer, so the windows work at the same time. Results go to the JSON file `out` as they
-    arrive; pages already saved without an error are skipped, so call it again until remaining is 0. Stops its loops
-    after `secs` seconds, counted from the call (opening windows included): give x.py a budget about 30 s above that.
-    A final sweep collects every result the loops kept; recovered_in_sweep above 0 means the polling missed some."""
+def _launch_apps(tabs, timeout=60):
+    """_launch_app for several Designer tabs at once: every step runs in each tab back to back, with one wait per
+    step, so n windows take about as long as one (one by one, setup took about 40 s for 3 windows)."""
     t0 = time.time()
-    store = _json.load(open(out, encoding="utf-8")) if os.path.exists(out) else {}
-    todo = [p for p in pages if not (p in store and "error" not in store[p])]
-    frames = []
+    todo = [d for d in tabs if not _bridge_of(d)]
     if todo:
-        tabs = designer_windows(min(n, len(todo)), ref)
-        frames = [_bridge_of(p) for p in tabs]
-        gens = [evaluate_t(f, _RUN_WORKER, {"ids": todo[i::len(frames)], "body": body, "arg": arg, "prelude": _PRELUDE},
-                           ms=15000) for i, f in enumerate(frames)]
-    done = [False] * len(frames)
-    while not all(done):
-        got = 0
-        for i, f in enumerate(frames):
-            if done[i]:
-                continue
-            r = evaluate_t(f, _RUN_POLL, None, ms=15000)
-            store.update(r["r"])
-            got += len(r["r"])
-            done[i] = r["done"]
-        if got:
-            _json.dump(store, open(out, "w", encoding="utf-8"), default=str)
-        progress(f"{sum(1 for p in pages if p in store)}/{len(pages)} pages in {len(frames)} windows")
-        if time.time() - t0 > secs:
-            for f in frames:
-                evaluate_t(f, _RUN_STOP, None, ms=15000)
+        for d in todo:
+            if not d.get_by_text("Webflow MCP Bridge App", exact=True).count():
+                d.locator("[aria-label^='Apps']").first.click()  # left-rail Apps icon ("Apps (E)")
+        todo[0].wait_for_timeout(1500)
+        for d in todo:
+            d.get_by_text("Webflow MCP Bridge App", exact=True).first.click(timeout=10000)
+        todo[0].wait_for_timeout(1500)
+        for d in todo:
+            launch = d.get_by_role("button", name=re.compile(r"^Launch"))
+            (launch if launch.count() else d.get_by_text("Launch", exact=True)).first.click(timeout=10000)
+        while not all(_bridge_of(d) for d in todo):
+            check()
+            if time.time() - t0 > timeout:
+                raise RuntimeError(f"bridge frame did not appear in {sum(1 for d in todo if not _bridge_of(d))} window(s)")
+            todo[0].wait_for_timeout(300)
+        todo[0].wait_for_timeout(3000)
+        for d in todo:
+            collapse = d.locator('button[aria-label="Collapse"]')
+            if collapse.count():
+                collapse.first.click()  # minimize, never close
+    return [_bridge_of(d) for d in tabs]
+
+
+MIN_WINDOW_W = 1100  # the Designer needs at least 900 px; narrower windows get "Your browser is too small"
+
+
+def tile_windows(pages, min_width=MIN_WINDOW_W):
+    """Spread windows across the screen, each at least min_width wide, overlapping when the screen is too narrow for
+    side by side (one per third of a 2560 px screen is 853 px: Webflow then covers the Designer with "Your browser is
+    too small"). Each is brought to front of its own window. Returns each window's innerWidth."""
+    if not pages:
+        return []
+    bs = browser.new_browser_cdp_session()
+    wids = [_cdp(p).send("Browser.getWindowForTarget")["windowId"] for p in pages]
+    # The real work area, from Windows itself (the page's screen.availWidth said 2560 where the work area was about
+    # 2040, and Chrome shrank windows placed past the edge). Never by maximizing a window: that activates it, and an
+    # activated window on another virtual desktop pulls the user over there.
+    import ctypes
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long), ("r", ctypes.c_long), ("b", ctypes.c_long)]
+    rc = _RECT()
+    ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rc), 0)  # SPI_GETWORKAREA
+    x0, y0, sw, sh = rc.l, rc.t, (rc.r - rc.l) or 1920, (rc.b - rc.t) or 1040
+    n = len(pages)
+    w = min(sw, max(min_width, sw // n))
+    step = (sw - w) // (n - 1) if n > 1 else 0
+    for wid in wids:
+        bs.send("Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "normal"}})
+    pages[0].wait_for_timeout(500)  # a restore lands after the call returns and would undo a resize sent right away
+    want = [{"left": max(0, x0) + i * step, "top": max(0, y0), "width": w, "height": min(sh, 1000)} for i in range(n)]
+    for attempt in range(3):
+        for p, wid, b in zip(pages, wids, want):
+            bs.send("Browser.setWindowBounds", {"windowId": wid, "bounds": b})
+        pages[0].wait_for_timeout(300)
+        if all(bs.send("Browser.getWindowBounds", {"windowId": wid})["bounds"]["width"] == b["width"]
+               for wid, b in zip(wids, want)):
             break
-        frames[0].page.wait_for_timeout(1000)
-    recovered = 0
-    for f, g in zip(frames, gens if frames else []):  # final sweep: every result the loop kept
-        for k, v in evaluate_t(f, _RUN_ALL, g, ms=15000).items():
-            if k not in store or ("error" in store[k] and "error" not in v):
-                store[k] = v
-                recovered += 1
-    _json.dump(store, open(out, "w", encoding="utf-8"), default=str)
-    left = [p for p in pages if p not in store]
-    times = [store[p]["secs"] for p in pages if p in store and "secs" in store[p]]
-    return {"done_total": len(pages) - len(left), "remaining": len(left), "windows": len(frames), "recovered_in_sweep": recovered,
-            "wall_s": round(time.time() - t0, 1), "avg_page_s": round(sum(times) / len(times), 2) if times else None,
-            "errors": [p for p in pages if "error" in store.get(p, {})]}
+    # No bring_to_front: every job window has one tab, which is always the front tab of its window, and activating a
+    # window that sits on another virtual desktop switches the user to that desktop.
+    return [p.evaluate("innerWidth") for p in pages]
 
 
 def launch_bridge(timeout=40):
@@ -608,3 +609,72 @@ def relaunch_bridge(timeout=100):
     launch_bridge()
     relay_attach()
     return round(time.time() - t0, 1)
+
+
+# ---- kept Designer windows: the session wf.py's operations (ops.py) work in ----
+MAX_JOB_WINDOWS = 6
+JOB_KEEP = int(os.environ.get("JOB_KEEP", 300))  # seconds a Designer window stays open, idle, for the next command
+def _pool():
+    """Designer windows that outlive the command that opened them, per site: {site key: [{"tab", "tid", "last",
+    "job"}]}. They stay open with their bridge app running for JOB_KEEP seconds after use, so the next command (the
+    write after a read, the QA after a write) starts at once instead of opening and loading windows again."""
+    return globals().setdefault("JOBWIN", {})
+
+
+def _log(msg):
+    fn = globals().get("activity")
+    if fn:
+        fn(msg)
+
+
+def _pool_ok(w):
+    """True if a kept window is still usable: open, on the Designer, bridge app answering."""
+    try:
+        d = w["tab"]
+        if d.is_closed():
+            return False
+        f = _bridge_of(d)
+        return bool(f) and evaluate_t(f, "async () => 1", None, ms=4000) == 1
+    except Exception:
+        return False
+
+
+def _pool_close(w):
+    try:
+        if not w["tab"].is_closed():
+            w["tab"].close()
+    except Exception:
+        pass
+    OWNED.discard(w["tid"])
+
+
+def job_windows_idle(close_all=False):
+    """Close kept Designer windows nobody used for JOB_KEEP seconds (all idle ones with close_all). The driver calls
+    this between snippets; wf.py close calls it with close_all. Returns how many it closed."""
+    n = 0
+    for key, wins in list(_pool().items()):
+        for w in list(wins):
+            if w["job"] is None and (close_all or time.time() - w["last"] > JOB_KEEP):
+                _pool_close(w)
+                wins.remove(w)
+                n += 1
+        if not wins:
+            _pool().pop(key, None)
+    if n:
+        _log(f"designer: closed {n} idle window(s)" + ("" if close_all else f" (unused for {JOB_KEEP}s)"))
+    return n
+
+
+def job_windows_status():
+    return [{"site": k, "open": len(v), "busy": sum(1 for w in v if w["job"]),
+             "idle_s": [round(time.time() - w["last"]) for w in v if not w["job"]]} for k, v in _pool().items()]
+
+
+def _job_new_window(cfg, tag):
+    """A new Chrome window for the session, already navigating to the site's Designer (video blocked first)."""
+    d = _new_window(tag)
+    tid = _target_id(d)
+    OWNED.add(tid)
+    block_media(d)
+    _cdp(d).send("Page.navigate", {"url": cfg["designer"]})
+    return d, tid

@@ -15,6 +15,25 @@ STOP_test
 playwright/tests/results.json
 playwright/tests/ri.json
 playwright/tests/ri_calls.txt
+playwright/tests/live_helper.jpg
+
+# live.py: this machine's GPU flags, and the registry of running runs
+playwright/machine.json
+playwright/runs/
+playwright/data/
+playwright/.session-windows.json
+playwright/.desk.json*
+
+# hand.py: per-site Chrome profiles (cookies and saved sign-ins of the user's accounts), its state and run files
+playwright/hand-profiles/
+playwright/.hand.json*
+playwright/.hand.lock
+playwright/.hand-run-*
+playwright/.hand-stop-*
+playwright/.watchdog.json
+
+# Designer job results (page data and planned/applied writes)
+playwright/jobs/
 
 .env
 __pycache__/

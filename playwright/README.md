@@ -1,220 +1,127 @@
-# Playwright driver for Webflow Designer
+# Webflow automation: wf.py
 
-A headed Chrome (CDP `:9222`, logged-in profile) and a long-lived Python driver that runs snippets you POST to it. Site-agnostic: keep site-specific notes in that project's AGENTS.md.
+Tools for working on Webflow sites with the fewest browser steps. Site-agnostic (site notes go in that project's AGENTS.md).
 
-| File | Purpose |
-|---|---|
-| `driver.py` | Attaches to Chrome and serves `POST http://127.0.0.1:8765/exec` and `GET /status`. Globals (`page`, `context`, `browser`, your own vars) persist between snippets; set `result = ...` to return a value. Env overrides: `DRIVER_PORT`, `CDP_PORT`, `DRIVER_STOP`, `DRIVER_TOKEN_FILE`. |
-| `x.py` | `python x.py [--budget S] [--label L] snippet.py` (or stdin; there is no `-` argument) runs a snippet. `python x.py --status` shows the running and last snippet. Exit codes: 0 ok, 1 snippet error, 3 stack down, 4 over budget, 5 busy. |
-| `watchdog.py` | `python watchdog.py 50` samples the RTX 4090 per process (`nvidia-smi pmon`). It kills the automation Chrome only when *its own* processes decode video or exceed N% SM for 3 samples in a row; other apps' load is only logged to `gpu.log`. A kill writes `STOP`; delete it to resume. `--test-kill` simulates one. |
-| `bridge.py` | Webflow helpers loaded into every snippet (reloaded when the file changes): `open_site`, `use`, `site`, `js`, `until`, `switch_page`, `open_canvas`, `select`, `designer`, `canvas`, `live`, `clip`, `paste_at`, `launch_bridge`, `relaunch_bridge`. See "Webflow helpers" and "Sites". |
-| `relay.py`, `relay.js`, `wb.py` | Designer API calls without Playwright. See "Relay". |
-| `sites/` | Per-site local settings, `<key>.json` (git-ignored; `example.json` is the template). Written by `open_site`. |
-| `tests/stress_guardrails.py` | Scores the guardrails against ground truth (see Guardrails). |
-| `chrome-profile/` | Logged-in Webflow profile (git-ignored). Reuse it; log in once per machine. |
+- **The store.** What is read from a site is saved under `data/<site>/` and reused: a page's component instances, props, text and what its canvas renders. Questions are answered from disk.
+- **One visit per page.** A Designer page is slow to open and fast to read, so every command opens a page once and does everything there: read, write, read back, check the render.
+- **Several windows at once**, kept open between commands, on another virtual desktop.
+- **One QA command** at the end of a task.
+
+AGENTS.md has the rules. REFERENCE.md has the Designer UI helpers, the pitfalls and the internals; it is not required reading.
 
 ## Start
 
-Check first: `python x.py --status` (exit 3 means the driver or Chrome is not up).
+Check first: `python wf.py status`.
 
 Run from this folder. On a new machine `chrome-profile/` doesn't exist yet: Chrome creates it, then log in to Webflow once in that window. It is git-ignored (cookies, logins, tokens). The adapter LUID is per machine: find yours or drop `--use-angle`/`--use-adapter-luid`.
 
 ```powershell
-# 1. Chrome (headed, pinned to the 5090; LUID 0x166d5 on this machine)
-Start-Process chrome.exe "--user-data-dir=`"$PWD\chrome-profile`" --remote-debugging-port=9222 --no-first-run --window-size=1600,1000 --use-angle=d3d11 --use-adapter-luid=0,166d5 --disable-accelerated-video-decode --autoplay-policy=user-gesture-required about:blank"
+# 1. Chrome (headed, pinned to the 5090; LUID 0x166d5 on this machine; muted; no background throttling)
+Start-Process chrome.exe "--user-data-dir=`"$PWD\chrome-profile`" --remote-debugging-port=9222 --no-first-run --window-size=1600,1000 --use-angle=d3d11 --use-adapter-luid=0,166d5 --disable-accelerated-video-decode --autoplay-policy=user-gesture-required --mute-audio --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion about:blank"
 # 2. Watchdog, then driver
 Start-Process -WindowStyle Hidden python 'watchdog.py 50'
 Start-Process -WindowStyle Hidden python driver.py
 ```
 
-## Guardrails
-
-Enforced by `driver.py` and `x.py`.
-
-- **Budget:** `--budget S` (default 90 s, max 300). The reply always arrives by budget + 10 s. Over budget exits 4: either still running (the driver stays busy until it ends) or finished late (result kept; the snippet doesn't call `check()` often enough).
-- **No queue:** a request while another runs is refused with exit 5, naming the running snippet, its elapsed time and last progress.
-- **Snippet helpers:**
-  - `run_items(items, fn, out, key=..., per_item=20)` runs `fn` per item, skips items already in `out` (errored ones are retried), saves after each, and stops before the budget. Returns `done_total`, `remaining`, `avg_s`, `slow` (over `per_item` s) and `errors`. Call again until `remaining == 0`.
-  - `evaluate_t(target, js, arg, ms=20000)` rejects with `ITEM TIMEOUT` after `ms`.
-  - `progress(msg)` is shown by `--status` and in BUSY/over-budget replies. `check()` raises `Budget` when time is up.
-- **Timings:** every reply prints `[secs of budget]`; use it and `avg_s` for estimates.
-- **Access:** the driver runs arbitrary code, so every request needs the `X-Token` from `.driver-token-<port>` (new random token per start, git-ignored; `x.py` sends it). Requests with an `Origin` header (any web page) or a non-localhost `Host` (DNS rebinding) get 403; `x.py` exits 1 with `FORBIDDEN: <reason>`. CDP `:9222` has no such check: any local process can drive the logged-in Chrome while it runs.
-
-```python
-# one bounded batch; re-run until remaining == 0
-JS = open(r"...\walk.js").read()
-result = run_items(PAGES, lambda p: evaluate_t(app, JS, {"id": p}), OUT, per_item=20)
-```
-
-**Stress test:** `python tests/stress_guardrails.py` (about 2.5 min; `--auth-only` runs just the access checks in seconds, without Chrome). It runs its own drivers on 8766 (real Chrome) and 8767 (dead CDP port) with its own STOP file, so 8765 is untouched, and prints TP/FP/TN/FN per detector against each snippet's real start and end. Rerun after any change to `driver.py` or `x.py`; it must show 0 FP and 0 FN. It covers over budget (±30 ms around the budget), the reply bound, busy under contention (290 requests), the `run_items` slow flag and exactly-once, `evaluate_t` (±40 ms), stack down, `--status`, and access (missing/wrong/prefix token, browser simple POST, `Origin`, rebinding `Host`, bad `Content-Length`; with Chrome it also confirms refused snippets never ran). Not covered: a real watchdog kill or Chrome restart.
-
-## Webflow helpers (`bridge.py`)
-
-Available in every snippet without importing; use them instead of rewriting frame lookups and polls.
-
-```python
-open_site("https://my-site.design.webflow.com/")     # open/reuse its Designer, launch the bridge, save sites/my-site.json
-r = js("const h = await byId(a); await tm('rename', () => h.setDisplayName('x')); return await h.getDisplayName()", el_id)
-# r = {ok, v | err, ms (in frame), rt (round trip), T: {rename: 47}, E: {...}}
-switch_page(page_id); open_canvas(component_id)       # page by id, name or slug (prefer id; a repeated name raises AMBIGUOUS); fire, poll until current, settle
-until("return (await webflow.getSelectedElement())?.type === 'Heading'")   # -> (seconds, value)
-select(el_id); paste_at(x, y, "text")                  # UI: select, then click a field, Ctrl+A, paste, Enter
-canvas(); live("/pricing")                             # the canvas frame; a tab on the staging URL (cache-busted)
-run_pages(page_ids, BODY, out, arg, n=3)              # a js() body on every page, over 3 Designer windows at once
-designer_windows(3); close_designer_windows()         # the windows run_pages uses; close the extras afterwards
-emulate(t, 390); t.reload(); snap(t, path, full=True)   # exact layout width via CDP, full-page/clip shot via CDP
-```
-
-- Inside a `js()` body: `a` is the argument, `byId(id)` finds an element on the current page or canvas, and `tm(label, fn, ms=8000)` times one call and records errors or hangs without stopping the batch.
-- `js()` never raises for JS errors or timeouts (`ok: False`). After a whole-call timeout it still returns the `T`/`E` gathered so far.
-- Some invalid bridge calls never settle (e.g. `setSettings('link', 1)` on a Heading); keep `tm`'s per-call `ms` short.
-- The driver's `page` is just the first tab. Use `designer()`, `canvas()`, `bridge_frame()` and `live()`, which resolve the current site's tabs.
-
-## Relay
-
-Sends Designer API calls straight to an open Designer, with Playwright out of the path. They keep working while the driver is busy, and a hung call fails at its own timeout and blocks nothing else.
-
-```
-wb.py --HTTP--> relay.py <--WebSocket-- Designer page (relay.js) --postMessage--> MCP Bridge App frame
-```
-
-```powershell
-python wb.py --status
-python wb.py --site my-site --timeout 30 script.js    # or the script on stdin; add --arg '<json>'
-```
-
-The script is an async function body: `a` is the arg, `webflow`, `byId` and `tm` are available, and `return` sends the result back. Exit codes: 0 ok, 1 script error, 3 relay down or that Designer not connected, 4 timeout.
-
-- **Setup:** none. `open_site()` starts `relay.py` if needed and connects the Designer. Each site needs one `open_site()`, which grants that Designer's origin local network access.
-- **Stays connected:** tested through a killed and restarted relay (about 1 s, 3 s at most), a Designer reload with nothing re-attaching it, and a killed driver: `wb.py` calls and page switches kept working with no driver running, and needed no relaunch afterwards. `js()` still needs `relaunch_bridge()` after a driver restart. `relay.js` is an init script on the tab and goes away with the driver, so a Designer reload or a Chrome restart stays disconnected (exit 3) until the next `open_site()`, which reconnects it.
-- **Why the page holds the socket:** Chrome blocks local network access from the cross-origin extension frame even with the permission granted, because the Designer doesn't delegate it. The Designer page holds the socket and relays to the frame with `postMessage`.
-- **Security:** `relay.py` binds to `127.0.0.1`. `.relay-token-<port>` (git-ignored, survives restarts) has a `control` token that runs code, which stays in that file, and a `client` token that only lets a page connect, which goes into the page script. The socket also requires a Designer `Origin`, and HTTP requests with an `Origin` header or a non-localhost `Host` are refused.
-- **Tested:** `python tests/test_relay.py` runs without Chrome against a fake Designer, on its own ports: refused callers, message sizes up to 3 MB, concurrency, timeouts, two sites, disconnects and restarts. Rerun it after changing `relay.py` or `wb.py`. Against a real Designer: 95 pages, two sites at once, 4 MB results, and a write confirmed with Data API `query_elements`. Loading a LAN dev server after the grant hasn't been tested.
-- **Limits:** the Designer has to be open with the bridge app launched (without it, calls return `BRIDGE APP NOT OPEN`), `webflow` calls only see the current page, and a timed-out call keeps running in the frame until it ends by itself.
-
-## Sites
-
-Nothing in the pipeline is tied to one Webflow project. Each site has local settings in `sites/<key>.json` (git-ignored; `sites/example.json` is the template):
+`live.py` starts its own Chromes with the same GPU flags, read from `machine.json`:
 
 ```json
-{"shortName": "my-site", "name": "My Site", "siteId": "…", "designer": "https://my-site.design.webflow.com/",
- "staging": "https://my-site.webflow.io/", "notes": "anything site-specific"}
+{"chrome_args": ["--use-angle=d3d11", "--use-adapter-luid=0,166d5"], "watchdog": true, "desktop": 2}
 ```
 
-- **Pick the site per call:** `x.py --site <ref>` (header `X-Site`). `<ref>` can be:
-  - the file key, short name, site name or site id
-  - its Designer or staging URL; an unknown site's URL creates `sites/<short>.json`, so a new project needs no setup
-  The site lasts for that one snippet; the next snippet starts with none, so sessions sharing the driver never inherit each other's site.
-- **Inside a snippet:**
-  - `use(ref)` switches the site for the rest of that snippet.
-  - `open_site(ref)` opens or reuses the Designer tab, launches the bridge, checks `webflow.getSiteInfo()` matches, and records `siteId` and `name`.
-  - `site()` returns the settings. `save_site(key, **fields)` adds your own (e.g. `notes`, key page ids).
-- **Without a site:** the helpers work only while exactly one Designer tab is open. With several they raise `SEVERAL DESIGNERS OPEN (a, b)` instead of guessing, because a guess edits another project.
-- **Bridge:** `launch_bridge()` opens it from the Apps panel by its label (no coordinates) and minimizes it. `relaunch_bridge()` reloads the Designer first; it's needed after a driver restart. `bridge_frame()` skips the detached copies a reload leaves behind.
-- **One client only:** a second Playwright driver on the same Chrome sees the Designer's cross-origin frames (canvas, bridge) as blank. Test helpers on the production driver; the stress test only covers the driver itself.
+It refuses to start without that file, while `STOP` exists, or (with `"watchdog": true`) when `gpu.log` hasn't been written for 20 s. It needs neither the Chrome above nor the driver.
 
-## Playwright pitfalls
+## wf.py: the four commands
 
-- **GPU:** a headed window renders on the 4090 by default, even with `--disable-gpu`. Pin it with `--use-angle=d3d11 --use-adapter-luid=0,166d5`. `--disable-accelerated-video-decode` keeps stray video off the GPU decoders, and `driver.py` blocks video URLs in Webflow Designer tabs (`*.design.webflow.com`, whose canvas plays every video on the page) through CDP `Network.setBlockedURLs`. Other tabs, e.g. a staging page, play video normally. Open the Designer through `open_site()` / `designer()` so the tab is blocked before it navigates.
-- **Local network prompt:** pages that load a LAN dev server (a Vite origin like `https://192.168.x.x:5173`) stop on Chrome's "Access other devices on your local network" prompt. `open_site()`, `relay_attach()` and `live()` call `grant_local_network(url)`, which uses CDP `Browser.setPermission` for that origin. Without an origin the call reports success but has no effect on Chrome 156, and `local-network-access`, `local-network` and `loopback-network` are granted separately. A tab on any other origin isn't covered, so call `grant_local_network(url)` for it first. Cross-origin iframes stay blocked unless the parent delegates the permission.
-- **Stack down:** when `STOP` exists or Chrome is gone, the driver refuses snippets and `x.py` exits 3 with the reason. After Chrome restarts and `STOP` is deleted, the next call reconnects.
-- **Viewport:** `page.set_viewport_size` can silently stop applying (after `bring_to_front`, `viewport_size` reports 390 while the page lays out at 1440). For layout checks use `emulate(tab, width)`, which sets CDP device metrics and raises if `innerWidth` disagrees; `clear_emulation(tab)` undoes it.
-- **Screenshots:** Playwright page and element screenshots can hang 30–100 s on Webflow pages and on the Designer. Use `snap(tab, path, full=True)` or `snap(tab, path, clip={...})` (CDP `Page.captureScreenshot`, JPEG with `quality=`). On the Designer, clip to the panel you need. `snap()` can stall too: on one published page it took 68–141 s in 3 of 3 captures, and other pages took 2.3 s in one run and 60–143 s in another. The tab was visible, animation frames kept firing, and it stalled with no reload and no `emulate()`. The cause is unknown, and `Page.captureScreenshot` can't be interrupted from a snippet, so don't put `snap()` in a batch.
-- **Touch input:** use raw `Input.dispatchTouchEvent` (touchStart, touchMoves, touchEnd) with `Emulation.setTouchEmulationEnabled`. It scrolled 520–550 px in 4 of 4 runs; `Input.synthesizeScrollGesture` with `gestureSourceType: "touch"` scrolled 0 px in 4 of 4, on a plain page and on a live site.
-- **Headless doesn't work for the Designer** (Webflow rejects the `HeadlessChrome` UA). Never spoof the UA; that is bot evasion.
-- **No `context.route()` with the sync driver:** routed requests are only answered while a snippet runs, so an idle driver stalls every tab. Block URLs through CDP.
-- **A driver only sees bridge frames created after it attached.** After a driver restart (or from a second client), the bridge iframe is invisible until it is relaunched: run `relaunch_bridge()` with the site set (reloads the Designer, launches the app, minimizes it; about 17 s).
-- **One snippet at a time on the main thread.** It can't be interrupted from outside. If one is truly hung, ask the user before killing `driver.py`.
-- **Never `await` canvas switches** (`webflow.openCanvas`, `switchPage`). Fire the call, then poll.
-- **No `networkidle`** on Webflow. Use `domcontentloaded`, then wait for a specific element.
-- **Encoding:** run with `PYTHONIOENCODING=utf-8`, or `\u200d` / `–` in results crash `x.py`.
-- **Text input:** paste, never type. For rich text, write `text/html` with `ClipboardItem` after `context.grant_permissions(["clipboard-read","clipboard-write"], origin=...)`. Lone or trailing spaces get trimmed: paste `"day to"`, not `" "`.
-- **Never complete bot checks or CAPTCHAs.** Hand them to the user.
+```powershell
+python wf.py sync  my-site /pricing /about "Blog - Categories Template"   # read pages into the store (--all, --fresh)
+python wf.py pages my-site [text]                                         # the site's pages, and how old their data is
+python wf.py find  my-site --prop "line clamp"                            # offline: which instances have such a prop
+python wf.py find  my-site --text "Lorem ipsum" --page /pricing           # offline: which instance holds or renders it
+python wf.py find  my-site --component Features-6 --top                   # offline: instances of a component
+python wf.py find  my-site --from findings.json --prop clamp              # offline: the instance behind each finding of a
+                                                                          # list, and whether it or its top component has such a prop
+python wf.py find  my-site --from findings.json --prop clamp --plan plan.json --value true --task disable-clamp
+                                                                          # ...and write the plan for exactly those instances
+python wf.py find  my-site --component Grid --page /blog --props          # offline: an instance's props
+python wf.py set   my-site plan.json            # write (--dry: resolve only, no browser)
+python wf.py qa    my-site --task disable-clamp # end-of-task check
+python wf.py read  my-site body.js /pricing     # a read-only JS body per page (`a` = arg, `els` = the page's elements)
+python wf.py run   my-site snippet.py           # a Designer UI snippet (REFERENCE.md "Webflow helpers")
+python wf.py status | close
+python wf.py mode "wfsync check every service page"   # which mode a message asks for (offline)
+```
 
-## Webflow Designer pitfalls
+**Mode.** Every command that opens windows takes `--mode wfasync` (the default: one Designer window, one live window, no concurrency) or `--mode wfsync` (up to 3 Designer windows, live windows up to the machine cap). The user chooses the mode with that word in their message; `python wf.py mode "<message>"` reads it (`router.py`: whole word, any case, not inside pasted text, fenced blocks or quoted lines; no word means `wfasync`; both words means ask). The command prints the mode it runs in and logs it to `activity.log`. `docs/router.md` has the design and the later automatic phase.
 
-- **Bridge app:** the Designer API lives in the `webflow-ext.com` iframe (Webflow MCP Bridge App). It disappears after reloads, canvas switches or closing it with X; minimize it instead. If a call fails twice, run `relaunch_bridge()` (it reloads the Designer and relaunches the app); after 2 failed relaunches, stop and tell the user.
-- **Coordinates go stale:** panels scroll and popups shift rows. Screenshot before each coordinate click and re-read state after each UI edit.
-- **Hidden copies:** the Designer keeps hidden copies of the canvas. Find text with `getBoundingClientRect().width > 0`. The copies don't all update live (one lagged after a slot reset), so compare frames or verify through the API.
-- **Binding buttons** in the Settings panel are `[data-automation-id="binding-button_<Label>"]` (e.g. `binding-button_Content` for rich text); click one, then pick the prop by its name.
-- **Script selections don't count** in rich text: Webflow's editor ignores a JS `Selection`, and Backspace deletes at the real caret. Select with clicks and keys (Home, Shift+Arrow, Shift+End, Ctrl+A) and check `getSelection()` first.
-- **Rich-text props:** **Edit Rich Text**, Ctrl+A, paste the full HTML once, then remove the trailing `\u200d` paragraph (Ctrl+End, Backspace).
-- **Slot defaults:** editing slot content on a page detaches it into a per-page copy. Edit the default in the component canvas, then `slot.resetToDefault()` on the pages.
-- **Component vs instance:** list every instance and compare values before editing. Edit the component only if the change is right for all of them.
-- **Links:** internal links in components and instances use type `page` (`{mode:'page', to:{pageId}}`), never `url`. Component link props can't point at "this item's referenced item"; only fixed items are offered.
-- **Collection-list filters** set in the Designer (e.g. "Item is not Current Item") show as `filters: []` in the Data API; verify them in the UI. "Current item" filters aren't offered inside components; unlink the instance if one is needed.
-- **Select options and form-state text** aren't in any API: Settings → Choices (pencil → Text/Value). Success messages show after switching State to Success.
+**What a page visit is.** Switching the Designer to a page takes 2.5-6 s and rendering it a few seconds more; reading every instance, prop and text of the page then takes 0.3 s and a write 0.08 s. So every command visits a page once and does all of its work in that visit, and what the visit read is saved.
 
-## Data API and bridge notes
+**The store** (`data/<site>/`, git-ignored, UTF-8: open its files with `encoding="utf-8"`; in a page file `component` is the component's name and `component_id` its id):
+- `site.json`: every page (id, name, slug, publish path, static or CMS template, draft), every component with its prop definitions, and the site's domains (`sync` prints the publish rule from them). Read without switching pages, in about 2 s.
+- `find --from FILE.json [--prop P]` takes a list of findings (records with `text` and `page`, `path`, `url` or `designer_page_id`, optionally `classes`; a report's data file with one list in it works) and prints the instance behind each, grouped by component; with `--prop` also whether that instance, and the top component around it, has a prop whose name contains P, with its value. `--plan FILE` then writes a plan that sets that prop (`--value`, JSON, default `true`) on exactly the top instances behind the findings; findings whose top component has no such prop are listed as not covered. `--json` prints one record per finding: `i`, `text`, `page`, `element`, `component`, `inside` (component names), `top`, `by`, `prop` (`[{propId, name, value, hasOverride}]`), `top_component`, `in_plan`. It matches the text the canvas renders, then prop values, then, for a CMS template whose canvas shows other items than the live page, the clamped node with the same class.
+- `pages/<page id>.json`: `instances` (element id, component, every prop with `propId`, `name`, `type`, `value`, `hasOverride`, `defaultValue`, and `inside`: the instances it sits in), `strings` (text elements), and `rendered`: every text node on the canvas with the instance that renders it, its classes, its line clamp and whether it is cut. `rendered` is what places CMS-bound text, which is in no prop.
+- `tasks/<task>.json`: what a task wrote and what its QA found.
+- A page counts as fresh for an hour. `set` saves the page again after writing, so the store stays exact through your own edits; edits made by hand in the Designer are picked up by `sync --fresh` or after the hour.
 
-- `set_component_instance_prop_values`: CMS binding is `type: "bindable"`, `binding_source_type: "cms"`; referenced fields use `refFieldId:::fieldId`. Link modes `page` and `collectionPage` are rejected; use bridge `el.setProps`.
-- Collection-item link on an element: `data_element_settings_tool` → `set_settings` → `{key:"link", static_link:{mode:"collectionPage"}}`.
-- **Embeds with bindings:** an HtmlEmbed whose code contains bindings returns `{sourceType: "unsupported", reason: "containsBindings"}` for `code`, from `el.searchSettings()` and from the Data API `get_settings` (where the resolved value is `null`). Static embeds return their code from both. It isn't a component prop, so `getProps()` doesn't list it. Read or edit it in the Designer: binding pill > Edit settings > Edit code, then read `.cm-content`'s `cmView.view.state.doc`.
-- `el.getProps()` has no prop names; match `propId` to the `id` in `component.getProps()`, which has `name`, `group`, `type` and `defaultValue`. Link values are `{mode, to}` with mode `page`, `url`, `pageSection`, `email`, `phone` or `collectionPage`.
-- `el.searchPropAvailableFields(propId)` lists filter fields and operators (`{filters:[{fieldSlug,operator,value}], filterMatch}`); `el.searchBindableSources()` lists CMS fields and reference paths.
-- `getAllElements()` includes elements placed in an instance's slot on the page: a page-wrapper slot's Nav-1 was returned, with the same results on 74 pages as a manual slot walk. Inherited slot defaults aren't page elements (see the next line). Don't walk the tree by hand to find components on a page.
-- Slot defaults aren't in the Data API. `component.getRootElement()` and `component.getSlotDefault(slotId)` read the trees without opening the canvas, but `getProps()` on instances inside them throws "Element not found" unless that component's canvas is open. `webflow.getSelectedElement()` returns null for slot-default content; edit it in the canvas Properties panel.
-- Remove one override: `el.setProps([{propId, value: null}])`, then read back `hasOverride: false`. `resetAllProps()` resets every prop.
-- **Discover before guessing:** `el.searchSettings()` lists every settable key with `valueType`, `canBind` and the current value. Always use the object form `el.setSettings({key: value})`; `setSettings('link', v)` fails with "Invalid mode".
-- **Bindings** inside a component: `el.setSettings({<key>: {sourceType: 'prop', propId}})`. Rich text uses key `richText`, not `text`. To unbind, set a plain value (`{richText: {innerText}}`); the `{sourceType: 'static', value}` shape `searchSettings` shows is rejected.
-- **Prop types** for `component.createProp({type, name})`: `textContent`, `string`, `richText`, `image`, `link`, `video`, `number`, `boolean`, `id`, `altText` (not listed by the API; only the error message names them). `variant` comes from `createVariant`, `slot` from a Slot element. Video values are `{src}`. A `setProps` batch is atomic: one invalid value fails all of it.
-- **`removeProp` on a bound prop** silently unbinds the elements (they fall back to empty). Check bindings first.
-- **`registerComponent(name, el)`** moves the element into the component and leaves no instance behind; `parent.append(component)` places one. `unlinkComponent()` turns an instance back into elements (its slots become plain Blocks).
-- **Slots:** append `elementPresets.Slot` inside the component; that creates a `slot` prop (not renamable with `setProp`). Slot defaults and overrides must be component instances (plain elements are rejected, in the UI too):
-  - default: `component.appendToSlotDefault(slotPropId, childComponent)`, no canvas needed; `getSlotDefault(slotPropId)` returns the instances.
-  - per instance: `inst.getSlots()[i]` has `append(component)`, `prepend`, `clear`, `getChildren`, `resetToDefault`.
-  - an inherited default and a cleared slot both read as `[]` (bridge and Data API). Only the rendered canvas shows the difference.
-- **Pages:** set `useTitleAsSearchTitle(false)` (and the matching `useTitleAs…`/`useDescriptionAs…` switches) before `setSearchTitle`/OG setters, or they throw. Page setters take 0.35–1.2 s each, `setDraft` about 4 s.
-- `getSelectedVariant()` throws unless the component is entered (canvas open).
-- **Undo:** Ctrl+Z in the Designer also undoes bridge writes. Don't send it unless you mean to.
-- Verify by reading values back through the API, not with screenshots alone.
+**A plan** (`set`):
 
-## Speed and reliability
+```json
+{"task": "disable-clamp",
+ "set": [{"where": {"component": "Features-6", "pages": ["/pricing", "/about"], "top": true, "text": "Related services"},
+          "props": {"Disable line clamp": true}},
+         {"page": "/about", "element": "<element id>", "props": {"<prop name or id>": null}},
+         {"page": "/about", "element": "<text element id>", "text": "New text"}],
+ "check": "(el, h) => h.all(el, '.card__p').every(n => h.css(n, '-webkit-line-clamp') === 'none')"}
+```
 
-- **Time one item, then batch with `run_items`.** Per-page cost varies widely: a full bridge page walk is about 5 s at the median (2.7 s of it the switch), but heavy pages take 70–200 s, so one site-wide call can run 25+ minutes. A component walk is under 1 s.
-- **Which layer:** measured on a test page.
+- `where` selects instances from the store: `component` (exact name wins over a substring), `pages`, `top` (not inside another instance), `text` (in a prop value or rendered by it), `element`. An explicit `page` + `element` works too. An unknown key is an error, never ignored.
+- A prop is named by its name or its id; a name that matches several props of the instance is an error that lists them. Values are type-checked against the prop definition. `null` removes the override.
+- The plan is resolved against the store before any browser step; an error there writes nothing.
+- `check` is optional: a function `(el, h)` that gets the instance's root node on the canvas and returns something truthy when it renders as intended. `h.all(el, selector)` gives the visible matches only (components often keep hidden placeholder copies that never change), `h.css(node, prop)` a computed value, `h.visible(node)` a test. Return `{pass: false, ...}` to have what the check saw printed. It runs in the same visit, after the write, and again in `qa`; `qa --check "<js>"` replaces a check that turned out wrong without writing again.
+- Props are set on the instance. A component's definition and default are never touched.
 
-  | Layer | Typical cost |
-  |---|---|
-  | Bridge, in frame | reads 15–30 ms (p95 55), element writes 40–90 ms, page writes 0.35–4 s |
-  | Bridge, parallel | `Promise.all` of 50 writes 0.46 s, about 10× faster than sequential |
-  | Playwright → bridge round trip | about 45 ms (p95 90) |
-  | UI click or paste plus read-back | 0.2–1.8 s |
-  | Data API (MCP) call | 6–19 s |
-  | Canvas switch | 1.4–3 s; Designer cold load about 60 s |
+**What `set` does per page:** compares the Designer's current value with the store's (`WAS STALE` if they differ), writes, reads the value and override flag back, runs `check` on the canvas, saves the page to the store. **What `qa` does:** reloads the session's Designer windows, so what they show was loaded from Webflow after the write, then reads every written value again and repeats `check`. It doesn't look at the published site.
 
-  So: do bulk reads and writes through the bridge inside one `evaluate`, batched with `Promise.all`; use the Data API for one-offs, and the UI only for what has no API.
-- **Read one component's props on every page.** `PAGES` is ids from the Data API `list_pages`, which includes drafts and templates. Run the calls in parallel inside the body. With `run_pages` over 3 windows, 95 pages took 3.7 min (one window: 8.5 min), and the results were identical on all 95. On 36 pages: 120 s against 291 s, identical; on 12 light pages the gain was only 1.3×.
+**Windows.** Operations run in up to 3 Designer windows of their own (one page per window at a time; your Designer tab keeps its page). Measured on 11 pages: 104 s in one window, 72 s in two, 48 s in three. The windows stay open for 5 minutes and the next command reuses them (`opened 0, reused 3`); a restarted driver closes the ones the old driver left. They sit on another virtual desktop (REFERENCE.md "Second desktop").
 
-  ```python
-  # x.py snippet; budget about 30 s above secs. Call again until remaining is 0, then close_designer_windows().
-  BODY = r"""
-  const rows = await Promise.all((await webflow.getAllElements()).filter(x => x.type === 'ComponentInstance').map(async e => {
-    const c = await e.getComponent();
-    if (await c.getName() !== a) return null;
-    const [defs, vals] = await Promise.all([c.getProps(), e.getProps()]);
-    const m = Object.fromEntries(defs.map(d => [d.id, d]));
-    return vals.map(v => [m[v.propId]?.name, v.value, v.hasOverride]);
-  }));
-  return rows.filter(Boolean);
-  """
-  result = run_pages(PAGES, BODY, r"...\props.json", arg="Component name", n=3, secs=240)
-  ```
+**Several agents.** The driver runs one command at a time. `wf.py` waits up to 150 s for it instead of failing, and the store is written atomically per page, so two agents can read and write different pages of a site one command after the other.
 
-  `wb.each_page` does the same in one window through the relay, without the driver.
-- **Several Designers at once:** Webflow allows several Designer tabs of one site; each keeps its own current page and needs its own bridge app (`designer_windows` launches them). Only separate windows help: on the same 12 pages, one window took 64.6 s, two tabs in one window 81.7 s, two windows 33.6 s and three windows 26.9 s. Per-page time rises with each window, so three is a good default.
-- **Each getter is a round trip** (about 20 ms): listing 55 pages with their parents took 2.8 s. Fetch once and reuse the handles.
-- **Throttled Designer:** a Designer tab that isn't in front of its window is throttled: every call takes about 1 s instead of 15–30 ms, through both `js()` and `wb.py`, and pages took 14 s each against 5.4 s in front. `switch_page` by name then times out, because it reads each page's name in turn. Fix: `designer().bring_to_front()`, which took calls from about 980 ms to 11–19 ms at once. It starts after a while behind another tab: a staging tab in front for 70 s didn't trigger it, and neither did a minimized window. Restarting the driver doesn't help.
-- **`switch_page` lookup:** an id matches without reading any names (about 0.06 s). A name or slug reads every page's name and slug in parallel (about 0.25 s among 95 pages, more when throttled). Names and slugs can repeat (two pages with the same name and slug): a repeated one raises `AMBIGUOUS` with the matching ids. Pass ids in bulk work.
-- **Time ops inside the frame** with a small wrapper that records per-call ms and catches per call, so one failure doesn't abort the batch or lose earlier timings.
-- **Agent time dominates:** in one benchmark 72% of the wall clock was the agent writing snippets between calls, not the tools. Reuse a helper file (frame lookup, `js()` wrapper, poll-until) instead of rewriting it per snippet.
-- **Switching pages:** fire `webflow.switchPage(page)`, poll `getCurrentPage().id`, then wait about 1.5 s before `getAllElements()`, or you read the previous page.
-- **Component canvas:** fire `webflow.openCanvas({componentId})`, poll `getCurrentComponent().id`, then wait about 5 s.
-  - Images are lazy: set `img.loading = 'eager'`, scroll each into view, wait, then read `currentSrc` (otherwise SVG placeholders).
-  - Read every non-extension frame and keep the one with real image sources.
-  - Slot wrappers are `.slot[data-w-id="<slot id>"]`, matching `instance.getSlots()` IDs. A page inherits a slot default only when that slot has 0 children on the page.
-  - Links render resolved (e.g. `/contact-form`), so `#` in the canvas is a real `#`.
-- **Canvas checks:** the canvas is the rendered DOM of the current Designer state, so `evaluate_t(canvas(), js)` answers layout and paint questions about unpublished work (on 4 pages it matched the published page). It doesn't run the site's custom code (a script-built form existed only on the live page), shows every FAQ answer open, and adds `data-wf-id` grid rules with `minmax(75px, auto)` rows, which can change heights. Check behaviour (hovers, IX, scripts) on a live page after a publish.
-- **Live site checks:** render in a new tab (`context.new_page()`), block video through CDP before `goto`, scroll to load lazy images, and judge visibility from computed styles. About 6 s per page. A static HTML crawl misjudges CSS-hidden elements and misses JS-built links. A live page shows the last publish, so it can't confirm the Designer's current state, drafts, or templates without a public page.
-- **Keep big reads out of the conversation.** Data API `get_all_elements` returns 50–100 KB per page; prefer `query_elements` with a filter, or a script that writes to a file and returns counts.
-- **Health:** `x.py --status` answers even while a snippet runs (exit 3 if down). Also check that the `watchdog.py` process exists and that there is no `STOP` file.
+## Live pages (`wf.py live`, `live.py`)
+
+Published pages, always in parallel: a run takes N Chrome windows (default 3), gives the next item to whichever is free and saves each result as it arrives. The Chromes are its own (not the driver's), stay open 5 minutes between runs and are reused.
+
+```powershell
+python wf.py live --site my-site check.py                          # a script: each(p, item) and ITEMS
+python wf.py live --site my-site --js scan.js /a /b /c             # one JS file on every page; saves what it returns
+python wf.py live --site my-site --shots C:\tmp\shots --widths 1440,390 /a /b   # full-page captures per width
+python wf.py live --status | --stop [PID] | --close
+```
+
+A script defines `ITEMS` (paths or URLs, or `{"path", "width"}`), `each(p, item)` (what to do on one loaded page; its return value is saved under the item in `OUT`) and optionally `done(results, summary)`; `OUT`, `WINDOWS`, `WIDTH`, `BUDGET`, `PER_PAGE`, `DEV` are optional settings. A full example is in REFERENCE.md ("A live script").
+
+
+- `p` is a Playwright page plus: `p.goto(target)` (raises `LoadError`), `p.evaluate(js, arg, timeout=30)`, `p.snap(path, full, clip, quality)` (clip in document CSS px), `p.emulate(width)`, `p.load_all()` (scrolls so lazy content loads), `p.wait(ms)`, `p.note(msg)`, `p.status`, `p.item`, `p.width`.
+- A load that answers 400 or above, fails on the network, or fires no `load` event in 30 s is a `LoadError`: the item is recorded as an error, the others go on, and the run ends with `FAILED ITEMS` and exit 1. A page over `PER_PAGE` (60 s) has its window replaced. Nothing a page does can hang a run.
+- `--budget` (240 s) stops handing out items; exit 4, run the same command again. Items already saved in `OUT` are skipped (`NOTHING TO DO` names the file; `--fresh` ignores it).
+- `--widths` runs every item at each width side by side. `--dev` loads the local Vite build (`document.devMode`, HTTPS errors ignored, local network allowed).
+- To place what a live check found in the Designer, use `wf.py find --text "<the text>"`: the store knows which instance renders it.
+- Video, downloads and Webflow's API, form endpoint, dashboard and Designer are blocked in every window.
+
+## Sign-in windows (`hand.py`)
+
+For sites that need the user's own sign-in (not Webflow: the driver's Chrome is already signed in there). The `signin-handoff` skill drives it.
+
+```powershell
+python hand.py open https://app.example.com     # a Chrome window on the user's desktop; prints a sign-in verdict
+python hand.py status                           # VERDICT: SIGNED IN | NOT YET | UNKNOWN, the tabs, where the window is
+python hand.py park                             # after sign-in: move it to the automation desktop (unpark brings it back)
+python hand.py run snippet.py                   # Playwright over CDP: page, context, cdp, snap(), check(), progress()
+python hand.py close [--forget]                 # --forget deletes the profile (the saved sign-in)
+```
+
+- One Chrome per site key, with a persistent profile in `hand-profiles/<key>/` (git-ignored). Same GPU flags as `live.py` from `machine.json`, muted, no background throttling, and the `--aite-hand` switch.
+- `watchdog.py` counts `--aite-hand` Chromes as ours and writes `.watchdog.json`. `hand.py` refuses to start (exit 3) when the running watchdog doesn't list that switch.
+- `desk.py` leaves these windows on the user's desktop until `park` lists their pid under `parked` in `.hand.json`.
+- Exit codes are `x.py`'s: 1 error, 3 stack down, 4 over budget (killed at budget + 10 s), 5 busy.
+- A keeper process closes windows after 30 minutes without a `hand.py` command (`hand_idle_s` in `machine.json`).
+- Tests: `python tests/test_hand.py`. It opens one window for about a minute and runs against a local fake sign-in page.

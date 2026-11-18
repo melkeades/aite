@@ -6,8 +6,13 @@ Guardrails (see README "Guardrails"):
 - Every snippet has a time budget (X-Budget header, default 90 s, max 300). The HTTP reply always comes back by
   budget + 10 s. A snippet still running then is reported as over budget (x.py exits 4) and keeps the driver busy.
 - One snippet at a time, never queued: a request that arrives while another runs is refused at once as BUSY
-  (x.py exits 5) with what is running, for how long, and its last progress.
-- GET /status shows the running snippet (label, elapsed, budget, last progress) and the last finished one.
+  (x.py exits 5) with what is running, for how long, and its last progress. POST /stop (x.py --stop) asks the running
+  snippet to stop: its next check() raises.
+- wf.py's Designer operations (ops.py: sync, set, qa, read) are snippets too. They work in Designer windows that stay
+  open between commands (bridge.py _pool); the main loop closes the ones left idle.
+- Live pages are not the driver's business: live.py opens its own Chromes and runs beside everything here.
+- GET /status shows the running snippet (label, elapsed, budget, last progress), the kept Designer windows and the
+  last finished snippet.
 - Snippet helpers: progress(msg), check() (raises Budget when over budget), run_items(...) for batch work that
   saves after every item and stops before the budget runs out, evaluate_t(...) for a JS call with a hard timeout.
   Webflow helpers (js, until, switch_page, open_canvas, select, clip, paste_at, open_site, ...) come from bridge.py,
@@ -19,9 +24,9 @@ Security: every request needs the X-Token header from the token file (a new rand
 by local processes, not by web pages). Requests with an Origin header (browsers) or a Host other than localhost (DNS
 rebinding) are refused with 403.
 
-Playwright's sync API must stay on the thread that started it, so snippets run on the main thread; the HTTP server
-runs on worker threads and only hands jobs over and waits for them."""
-import json, os, time, traceback, io, contextlib, queue, threading, urllib.request, secrets, hmac
+Playwright's sync API must stay on the thread that started it, so snippets (and the Designer job service) run on the
+main thread; the HTTP server runs on worker threads and only hands snippets over and waits for them."""
+import json, os, sys, time, traceback, io, queue, threading, urllib.request, urllib.parse, secrets, hmac
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from playwright.sync_api import sync_playwright
 
@@ -41,22 +46,50 @@ blocked = []
 jobs = queue.Queue()
 admit = threading.Lock()
 state = {"busy": None, "queued": False, "last": None}
+OWNED = set()  # CDP target ids of the kept session windows; shared-tab helpers skip them
+_tl = threading.local()  # the running snippet's stdout buffer (out), on the main thread only
+
+
+class _ThreadStdout:
+    """print() inside a snippet goes to that snippet's buffer; other threads' prints are unaffected."""
+    def __init__(self, base):
+        self.base = base
+
+    def write(self, s):
+        return (getattr(_tl, "out", None) or self.base).write(s)
+
+    def flush(self):
+        (getattr(_tl, "out", None) or self.base).flush()
+
+
+sys.stdout = _ThreadStdout(sys.stdout)
 
 
 class Budget(Exception):
     """Raised by check() when the running snippet has used up its budget."""
 
 
+class Stopped(Budget):
+    """Raised by check() after x.py --stop. A Budget, so helpers that let Budget through let this through too."""
+
+
+def cur():
+    """The state of the running snippet."""
+    return state["busy"]
+
+
 def progress(msg):
     """Record what the snippet is doing; shown by GET /status and in BUSY / over-budget replies."""
-    st = state["busy"]
+    st = cur()
     if st:
         st["progress"], st["progress_at"] = str(msg)[:300], time.time()
 
 
 def check():
     """Raise Budget if the running snippet is over its budget. Call it between steps of long work."""
-    st = state["busy"]
+    st = cur()
+    if st and st.get("stop"):
+        raise Stopped(f"stopped by x.py --stop; last progress: {st.get('progress')}")
     if st and time.time() - st["start"] > st["budget"]:
         raise Budget(f"budget {st['budget']}s used up; last progress: {st.get('progress')}")
 
@@ -65,7 +98,7 @@ def run_items(items, fn, out, key=lambda it: it, per_item=20):
     """Run fn(item) for each item not already in the JSON file `out`, saving after every item.
     Stops before the budget runs out (call again for the next batch). Items slower than per_item seconds are
     listed under "slow" so they get reported instead of silently waited on. Returns a summary dict."""
-    st = state["busy"]
+    st = cur()
     store = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else {}
     keys = [str(key(it)) for it in items]
     todo = [(k, it) for k, it in zip(keys, items) if not (k in store and not (isinstance(store[k], dict) and "error" in store[k]))]
@@ -106,16 +139,34 @@ def evaluate_t(target, js, arg=None, ms=20000):
     return target.evaluate(wrapped, arg)
 
 
-env = {"json": json, "browser": None, "progress": progress, "check": check, "run_items": run_items,
-       "evaluate_t": evaluate_t, "Budget": Budget, "HERE": HERE, "SITE": None}
-HELPERS = os.path.join(HERE, "bridge.py")
+ACTIVITY = os.path.join(HERE, "activity.log")
+
+
+def activity(msg):
+    """One line per thing that opens, reuses or closes windows (activity.log, shared with live.py): what a task really
+    did on screen, for the user and for whoever debugs it afterwards."""
+    try:
+        with open(ACTIVITY, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+JOBWIN = {}    # kept Designer windows per site (bridge.py _pool); lives here so a bridge.py reload keeps them
+env = {"json": json, "progress": progress, "check": check, "run_items": run_items, "evaluate_t": evaluate_t,
+       "Budget": Budget, "HERE": HERE, "MEDIA": MEDIA, "OWNED": OWNED, "browser": None, "SITE": None,
+       "JOBWIN": JOBWIN, "activity": activity, "cur": cur}
+HELPERS = [os.path.join(HERE, "bridge.py"), os.path.join(HERE, "ops.py"), os.path.join(HERE, "store.py")]
 
 
 def load_helpers():
-    """Load bridge.py into the snippet globals; reload it whenever the file changes, so edits need no restart."""
-    m = os.path.getmtime(HELPERS) if os.path.exists(HELPERS) else None
-    if m and m != env.get("_helpers_mtime"):
-        exec(compile(open(HELPERS, encoding="utf-8").read(), HELPERS, "exec"), env)
+    """Load bridge.py and then ops.py into the snippet globals; reload them whenever one of them (or store.py, which
+    ops.py imports) changes, so edits need no restart."""
+    m = tuple(os.path.getmtime(f) if os.path.exists(f) else None for f in HELPERS)
+    if m != env.get("_helpers_mtime"):
+        for f in HELPERS[:2]:
+            if os.path.exists(f):
+                exec(compile(open(f, encoding="utf-8").read(), f, "exec"), env)
         env["_helpers_mtime"] = m
 
 
@@ -151,7 +202,7 @@ def connect():
     env["ws"] = chrome_ws()
     browser = pw.chromium.connect_over_cdp(CDP, timeout=10000)
     context = browser.contexts[0]
-    page = context.pages[0] if context.pages else context.new_page()
+    page = next((p for p in context.pages if not p.is_closed()), None) or context.new_page()
     page.set_viewport_size({"width": 1600, "height": 1000})
     env.update(browser=browser, context=context, page=page)
     blocked.clear()
@@ -159,7 +210,7 @@ def connect():
 
 
 def stack_down():
-    """None if Chrome is usable (reconnecting if needed), else the reason it is not."""
+    """None if Chrome is usable (reconnecting if needed), else the reason it is not. Main thread only."""
     if os.path.exists(STOP):
         return "WATCHDOG STOPPED CHROME: " + open(STOP).read().strip()
     try:
@@ -182,17 +233,47 @@ def busy_text():
     st = state["busy"]
     if not st:
         return "a snippet is about to start"
+    return _describe(st)
+
+
+def _describe(st):
     now = time.time()
     p = f"; last progress {now - st['progress_at']:.0f}s ago: {st['progress']}" if st.get("progress") else "; no progress reported"
     return f"'{st['label']}' running for {now - st['start']:.0f}s (budget {st['budget']}s){p}"
 
 
-def execute(job):
-    """Runs on the main thread."""
-    state["busy"] = {"label": job["label"], "start": time.time(), "budget": job["budget"]}
-    state["queued"] = False
+def run_code(job, env_, st):
+    """Execute a snippet in env_ on this thread. Returns the reply body (without secs)."""
     out = io.StringIO()
-    env["result"] = None
+    env_["result"] = None
+    _tl.out = out
+    try:
+        t_exec = time.time()
+        exec(job["code"], env_)
+        body = {"ok": True, "stdout": out.getvalue(), "result": env_.get("result")}
+        ran = time.time() - t_exec
+        if ran > job["budget"]:
+            # finished, but late: still an overrun (snippet never called check()); result is kept
+            body.update(over_budget=True, error=f"OVER BUDGET: finished in {ran:.1f}s, budget {job['budget']}s "
+                                                f"(snippet doesn't call check() often enough)")
+    except Stopped as e:
+        body = {"ok": False, "stopped": True, "stdout": out.getvalue(), "result": env_.get("result"),
+                "error": f"STOPPED: {e}"}
+    except Budget as e:
+        body = {"ok": False, "over_budget": True, "stdout": out.getvalue(), "result": env_.get("result"),
+                "error": f"OVER BUDGET: {e}"}
+    except Exception:
+        body = {"ok": False, "stdout": out.getvalue(), "error": traceback.format_exc()[-3000:]}
+    finally:
+        _tl.out = None
+    return body
+
+
+def execute(job):
+    """Run one snippet (main thread)."""
+    st = state["busy"] = {"label": job["label"], "start": time.time(), "budget": job["budget"]}
+    activity(f"driver: snippet '{job['label']}' started" + (f" [{job['site']}]" if job.get("site") else ""))
+    state["queued"] = False
     env["SITE"] = job.get("site")  # per snippet (X-Site / x.py --site), never carried over to the next one
     t0 = time.time()
     down = stack_down()
@@ -202,33 +283,41 @@ def execute(job):
         try:
             block_media()
             load_helpers()
-            t_exec = time.time()
-            with contextlib.redirect_stdout(out):
-                exec(job["code"], env)
-            body = {"ok": True, "stdout": out.getvalue(), "result": env.get("result")}
-            ran = time.time() - t_exec
-            if ran > job["budget"]:
-                # finished, but late: still an overrun (snippet never called check()); result is kept
-                body.update(over_budget=True, error=f"OVER BUDGET: finished in {ran:.1f}s, budget {job['budget']}s "
-                                                    f"(snippet doesn't call check() often enough)")
-        except Budget as e:
-            body = {"ok": False, "over_budget": True, "stdout": out.getvalue(), "result": env.get("result"),
-                    "error": f"OVER BUDGET: {e}"}
+            body = run_code(job, env, st)
         except Exception:
-            tb = traceback.format_exc()[-3000:]
-            body = {"ok": False, "stdout": out.getvalue(), "error": tb}
-            if "has been closed" in tb or "disconnected" in tb.lower():
-                env["browser"] = None
-                down = stack_down()
-                if down:
-                    body.update(stack_down=True, error=down + "\n" + tb)
+            body = {"ok": False, "stdout": "", "error": traceback.format_exc()[-3000:]}
+        tb = body.get("error") or ""
+        if not body["ok"] and ("has been closed" in tb or "disconnected" in tb.lower()):
+            env["browser"] = None
+            down = stack_down()
+            if down:
+                body.update(stack_down=True, error=down + "\n" + tb)
+    finish(job, body, t0)
+    state["busy"] = None
+    job["done"].set()
+
+
+def finish(job, body, t0):
     secs = round(time.time() - t0, 1)
     body["secs"] = secs
     state["last"] = {"label": job["label"], "secs": secs, "ok": body["ok"], "ended": time.strftime("%H:%M:%S"),
                      "late": secs > job["budget"] + REPLY_GRACE}
-    state["busy"] = None
     job["body"] = body
-    job["done"].set()
+
+
+def service_jobs():
+    """Between snippets: close kept Designer windows that have been idle too long, or all idle ones after /close."""
+    close_all = state.pop("close_windows", False)
+    if not JOBWIN or not (close_all or time.time() - state.get("idle_checked", 0) > 5):
+        return
+    state["idle_checked"] = time.time()
+    try:
+        if stack_down():
+            return
+        load_helpers()
+        env["job_windows_idle"](close_all)
+    except Exception as e:
+        print("window service failed:", str(e)[:300], flush=True)
 
 
 class H(BaseHTTPRequestHandler):
@@ -262,7 +351,11 @@ class H(BaseHTTPRequestHandler):
         st = dict(state["busy"]) if state["busy"] else None
         if st:
             st["elapsed"] = round(time.time() - st["start"], 1)
-        self.reply({"busy": st, "busy_text": busy_text() if st else None, "last": state["last"]})
+        try:
+            wins = env["job_windows_status"]() if "job_windows_status" in env else []
+        except Exception:
+            wins = []
+        self.reply({"busy": st, "busy_text": busy_text() if st else None, "last": state["last"], "windows": wins})
 
     def do_POST(self):
         size = int(self.headers.get("Content-Length") or 0)
@@ -270,32 +363,59 @@ class H(BaseHTTPRequestHandler):
             self.close_connection = True
             return self.refuse(f"body size {size} outside 0..{MAX_BODY} bytes")
         # read the body before refusing, so the client gets the 403 instead of a reset connection
-        code = self.rfile.read(size).decode("utf-8", "replace")
+        raw = self.rfile.read(size).decode("utf-8", "replace")
         why = self.denied()
         if why:
             return self.refuse(why)
+        u = urllib.parse.urlparse(self.path)
+        if u.path == "/close":  # close the kept Designer job windows that are idle (the main loop does it)
+            state["close_windows"] = True
+            return self.reply({"ok": True})
+        if u.path == "/stop":
+            st = state["busy"]
+            if st:
+                st["stop"] = True
+            return self.reply({"ok": bool(st), "error": None if st else "nothing is running",
+                               "busy_text": busy_text() if st else None})
         try:
             budget = max(1, min(int(self.headers.get("X-Budget", DEFAULT_BUDGET)), MAX_BUDGET))
         except ValueError:
             budget = DEFAULT_BUDGET
         label = (self.headers.get("X-Label") or "snippet")[:120]
         site = (self.headers.get("X-Site") or "").strip()[:200] or None
+        if (self.headers.get("X-Mode") or "").strip().lower() == "read":
+            return self.reply({"ok": False, "stdout": "",
+                               "error": "READ LANES ARE GONE: live pages run through live.py "
+                                        "(python live.py --site KEY script.py); see README, Live pages"})
+        job = {"code": raw, "budget": budget, "label": label, "site": site, "done": threading.Event()}
         with admit:
             if state["busy"] or state["queued"]:
                 return self.reply({"ok": False, "busy": True, "stdout": "",
                                    "error": "BUSY: refused, not queued. " + busy_text()})
             state["queued"] = True
-            job = {"code": code, "budget": budget, "label": label, "site": site, "done": threading.Event()}
             jobs.put(job)
         if job["done"].wait(budget + REPLY_GRACE):
             return self.reply(job["body"])
         self.reply({"ok": False, "over_budget": True, "still_running": True, "stdout": "",
-                    "error": f"OVER BUDGET, STILL RUNNING: {busy_text()}. New snippets are refused until it ends."})
+                    "error": f"OVER BUDGET, STILL RUNNING: '{label}'. {busy_text()}. New snippets are refused until it "
+                             f"ends; x.py --stop asks it to stop at its next check()."})
 
 
 with open(TOKEN_FILE, "w") as f:
     f.write(TOKEN)
 print("driver ready", stack_down() or "connected", flush=True)
+try:  # automation windows live on another virtual desktop when machine.json says so
+    sys.path.insert(0, HERE)
+    import desk
+    desk.ensure()
+except Exception as _e:
+    print("desk not started:", _e, flush=True)
 threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever, daemon=True).start()
 while True:
-    execute(jobs.get())
+    try:
+        _job = jobs.get(timeout=0.25)
+    except queue.Empty:
+        service_jobs()  # Designer job results, between snippets
+        continue
+    execute(_job)
+    service_jobs()

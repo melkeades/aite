@@ -12,9 +12,9 @@ Exit codes:
   4 timeout
 
 From Python:
-    from wb import run, switch, each_page
+    from wb import run, switch
     r = run("return await (await webflow.getCurrentPage()).getName()", site="my-site")   # {ok, v | err, ms, rt}
-    result = each_page("my-site", page_ids, BODY, r"...\\out.json", arg="Component name")"""
+One call on the Designer's current page. A body on many pages is a Designer job (x.py --job)."""
 import json, os, sys, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -70,35 +70,6 @@ def switch(site, page_id, timeout=30):
             return None
         time.sleep(0.1)
     return f"page {page_id} not current after {timeout}s"
-
-
-def each_page(site, pages, code, out, arg=None, budget=270, per_page=40):
-    """Run `code` on every page id, saving to the JSON file `out` after each one; pages already saved are skipped, so
-    call it again until remaining is 0. Pages slower than per_page seconds are listed under slow."""
-    store = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else {}
-    todo = [p for p in pages if not (p in store and "error" not in store[p])]
-    start, times, slow = time.time(), [], []
-    for p in todo:
-        est = sum(times) / len(times) if times else 0
-        if time.time() - start + est > budget:
-            break
-        t0 = time.time()
-        err = switch(site, p)
-        if err:
-            v = {"error": err}
-        else:
-            r = run(code, arg, site, per_page)
-            v = {"v": r["v"]} if r["ok"] else {"error": r["err"]}
-        dt = time.time() - t0
-        v["secs"] = round(dt, 2)
-        store[p] = v
-        times.append(dt)
-        if dt > per_page:
-            slow.append([p, round(dt, 1)])
-        json.dump(store, open(out, "w", encoding="utf-8"), default=str)
-    return {"done_now": len(times), "done_total": sum(1 for p in pages if p in store), "total": len(pages),
-            "remaining": sum(1 for p in pages if p not in store), "avg_s": round(sum(times) / len(times), 2) if times else None,
-            "slow": slow, "errors": [p for p in pages if "error" in store.get(p, {})]}
 
 
 if __name__ == "__main__":

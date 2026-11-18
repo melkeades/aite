@@ -1,0 +1,8 @@
+{
+  "chrome_args": [
+    "--use-angle=d3d11",
+    "--use-adapter-luid=0,<LUID of the GPU Chrome may use>"
+  ],
+  "watchdog": true,
+  "desktop": 2
+}

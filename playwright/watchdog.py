@@ -1,8 +1,10 @@
-"""Watch the RTX 4090 (nvidia-smi index 1) per process. Kill the automation Chrome (the one using our chrome-profile)
-only when its own processes use the 4090: any video decode, or SM load over LIMIT%, for 3 samples in a row.
+"""Watch the RTX 4090 (nvidia-smi index 1) per process. Kill the automation Chromes (the one using our chrome-profile,
+the ones live.py starts and hand.py's sign-in windows) only when its own processes use the 4090: any video decode, or SM load over LIMIT%, for 3 samples in a row.
 Load from other apps is logged with the process name but never kills our Chrome.
 On a kill, write STOP; driver.py turns it into an error (x.py exit code 3) on the next call.
-`python watchdog.py --test-kill` kills the automation Chrome and writes STOP, to test that error path."""
+`python watchdog.py --test-kill` kills the automation Chrome and writes STOP, to test that error path.
+`python watchdog.py --pids` prints the automation Chrome pids it would watch, and exits.
+While running it keeps .watchdog.json ({pid, marks}): hand.py refuses to start a window the watchdog doesn't cover."""
 import subprocess, time, os, sys, json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -10,16 +12,21 @@ LIMIT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 5
 STOP = os.path.join(HERE, "STOP")
 LOG = os.path.join(HERE, "gpu.log")
 PROFILE = os.path.join(HERE, "chrome-profile").lower()
+LIVE_MARK = "--aite-live"  # live.py starts its own Chromes with this switch
+HAND_MARK = "--aite-hand"  # hand.py starts its sign-in Chromes with this one
+MARKS = ["chrome-profile", LIVE_MARK, HAND_MARK]
+INFO = os.path.join(HERE, ".watchdog.json")
 
 
 def automation_pids():
-    """Chrome processes started with our profile, plus all their descendants (gpu/renderer/utility)."""
+    """Chrome processes started with our profile or by live.py, plus all their descendants (gpu/renderer/utility)."""
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
           "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress")
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout.strip()
     rows = json.loads(out) if out else []
     rows = [rows] if isinstance(rows, dict) else rows
-    ours = {r["ProcessId"] for r in rows if PROFILE in (r.get("CommandLine") or "").lower()}
+    ours = {r["ProcessId"] for r in rows if PROFILE in (r.get("CommandLine") or "").lower()
+            or LIVE_MARK in (r.get("CommandLine") or "") or HAND_MARK in (r.get("CommandLine") or "")}
     while True:
         kids = {r["ProcessId"] for r in rows if r["ParentProcessId"] in ours} - ours
         if not kids:
@@ -57,6 +64,12 @@ if "--test-kill" in sys.argv:
     print("test kill done", flush=True)
     sys.exit(0)
 
+if "--pids" in sys.argv:
+    print(json.dumps(sorted(automation_pids())))
+    sys.exit(0)
+
+with open(INFO, "w", encoding="utf-8") as f:
+    json.dump({"pid": os.getpid(), "marks": MARKS, "limit": LIMIT, "at": time.time()}, f)
 bad = 0
 peak = 0
 ours, tick, fails = set(), 0, 0
@@ -96,4 +109,8 @@ while not os.path.exists(STOP):
         print("STOPPED", my_sm, my_dec, flush=True)
         break
     time.sleep(1)
+try:
+    os.remove(INFO)
+except OSError:
+    pass
 print("watchdog exit, peak", peak, flush=True)
